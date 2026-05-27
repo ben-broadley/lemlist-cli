@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""lemlist — read-only CLI over the lemlist REST API.
+"""lemlist — CLI over the lemlist REST API.
 
 Auto-generated from the OpenAPI spec sitting next to this script (openapi.json).
+Covers every operation in the spec: GET, POST, PUT, PATCH, DELETE.
+
 Set LEMLIST_API_KEY in your environment. JSON is written to stdout.
 
 Quick start:
@@ -11,8 +13,14 @@ Quick start:
   ./lemlist get-team
   ./lemlist get-many-campaigns --status running --all
   ./lemlist get-campaign cam_xxx
-  ./lemlist dump-all ../lemlist-data   # pull every list endpoint into a folder
+  ./lemlist create-campaign --name "My new campaign" --timezone Australia/Sydney
+  ./lemlist update-campaign cam_xxx --body '{"name":"renamed"}'
+  ./lemlist delete-schedule sch_xxx
+  ./lemlist dump-all ../lemlist-data   # GET-only bulk snapshot
   ./lemlist dump-all ../lemlist-data --with-campaigns  # also drill per-campaign
+
+Write methods (POST/PUT/PATCH/DELETE) MUTATE your lemlist tenant.
+`dump-all` only hits GET endpoints — it is always read-only.
 
 Auth: lemlist uses HTTP Basic with the API key as the password and an
 empty username. Override with --user if needed.
@@ -53,8 +61,45 @@ def load_spec() -> dict:
         return json.load(f)
 
 
+METHODS = ("get", "post", "put", "patch", "delete")
+
+
+# Hand-picked defaults for endpoints whose `requestBody` schema is too open-ended
+# for the spec to capture a useful default (e.g. lemleads search needs `filters`,
+# `page`, `size` but the spec marks them all optional).
+BODY_DEFAULTS: dict = {
+    "search-people-database": {"filters": [], "page": 1, "size": 100},
+    "search-companies-database": {"filters": [], "page": 1, "size": 100},
+}
+
+# Backward-compatible aliases for command names that existed before the full-spec
+# expansion. Maps old name -> current auto-derived name.
+COMMAND_ALIASES: dict = {
+    "search-people": "search-people-database",
+    "search-companies": "search-companies-database",
+    "batch-campaign-stats": "get-batch-campaign-stats",
+}
+
+
+def _extract_body_schema(op: dict) -> dict | None:
+    """Pull the JSON body schema out of an operation's requestBody, if any."""
+    rb = op.get("requestBody")
+    if not rb:
+        return None
+    content = (rb.get("content") or {}).get("application/json", {})
+    schema = content.get("schema")
+    if not schema:
+        return None
+    return {
+        "schema": schema,
+        "required_top": list(schema.get("required") or []),
+        "properties": dict(schema.get("properties") or {}),
+        "request_body_required": bool(rb.get("required")),
+    }
+
+
 def build_registry(spec: dict) -> dict:
-    """Map command name -> operation metadata for every GET endpoint.
+    """Map command name -> operation metadata for every operation in the spec.
 
     OpenAPI parameters can be declared at the path level (shared across all methods
     on that path) or the operation level. Merge both — operation-level wins on collision.
@@ -62,104 +107,60 @@ def build_registry(spec: dict) -> dict:
     registry: dict = {}
     for path, methods in spec.get("paths", {}).items():
         path_level = methods.get("parameters", []) or []
-        op = methods.get("get")
-        if not op:
-            continue
-        op_level = op.get("parameters", []) or []
-        seen = {p["name"] for p in op_level}
-        params = op_level + [p for p in path_level if p["name"] not in seen]
-        summary = op.get("summary") or op.get("operationId") or path
-        name = slugify(summary)
-        base, i = name, 2
-        while name in registry:
-            name = f"{base}-{i}"
-            i += 1
-        registry[name] = {
-            "path": path,
-            "summary": summary,
-            "description": op.get("description", "") or "",
-            "path_params": [p for p in params if p.get("in") == "path"],
-            "query_params": [p for p in params if p.get("in") == "query"],
-            "method": "GET",
-        }
-    # Add hand-curated POST endpoints that are reads but documented outside the spec.
-    for name, meta in POST_COMMANDS.items():
-        registry[name] = dict(meta, path_params=[], query_params=[], method="POST")
+        for method in METHODS:
+            op = methods.get(method)
+            if not op:
+                continue
+            op_level = op.get("parameters", []) or []
+            seen = {p["name"] for p in op_level}
+            params = op_level + [p for p in path_level if p["name"] not in seen]
+            summary = op.get("summary") or op.get("operationId") or path
+            name = slugify(summary)
+            base, i = name, 2
+            while name in registry:
+                name = f"{base}-{i}"
+                i += 1
+            entry = {
+                "path": path,
+                "summary": summary,
+                "description": op.get("description", "") or "",
+                "path_params": [p for p in params if p.get("in") == "path"],
+                "query_params": [p for p in params if p.get("in") == "query"],
+                "method": method.upper(),
+                "body": _extract_body_schema(op),
+            }
+            if name in BODY_DEFAULTS:
+                entry["default_body"] = BODY_DEFAULTS[name]
+            registry[name] = entry
     return registry
-
-
-POST_COMMANDS: dict = {
-    "search-people": {
-        "path": "/database/people",
-        "summary": "Search lemlist's People Database (POST with body)",
-        "description": (
-            "POST {\"filters\": [...], \"page\": 1, \"size\": 100} to lemlist's People DB. "
-            "filters[] is required: each item is {filterId, in:[], out:[]}. "
-            "Default body sends an empty filters array — may return zero results "
-            "if lemlist requires at least one filter. Discover valid filterIds via `get-database-filters`."
-        ),
-        "default_body": {"filters": [], "page": 1, "size": 100},
-    },
-    "search-companies": {
-        "path": "/database/companies",
-        "summary": "Search lemlist's Companies Database (POST with body)",
-        "description": (
-            "POST {\"filters\": [...], \"page\": 1, \"size\": 100} to lemlist's Companies DB. "
-            "filters[] is required. Discover valid filterIds via `get-database-filters`."
-        ),
-        "default_body": {"filters": [], "page": 1, "size": 100},
-    },
-    "batch-campaign-stats": {
-        "path": "/v2/campaigns/stats/batch",
-        "summary": "Get stats for many campaigns in one POST (max 100 IDs)",
-        "description": (
-            "POST {\"campaignIds\": [...], \"startDate\": ISO, \"endDate\": ISO}. "
-            "All three are required. Max 100 IDs per call. Used by `dump-all --with-search` "
-            "(chunks IDs and uses a 365-day window ending today)."
-        ),
-        "default_body": None,  # no sensible default — caller must provide
-    },
-}
 
 
 def _basic_auth_header(api_key: str, user: str) -> str:
     return "Basic " + base64.b64encode(f"{user}:{api_key}".encode()).decode()
 
 
-def request(path: str, query: dict, api_key: str, user: str = "") -> object:
-    qs_pairs = [(k, v) for k, v in query.items() if v is not None and v != ""]
+def http_request(
+    method: str,
+    path: str,
+    query: dict | None = None,
+    body: object = None,
+    api_key: str = "",
+    user: str = "",
+) -> object:
+    """Single HTTP entry point. GET/DELETE ignore `body`; POST/PUT/PATCH send JSON."""
+    qs_pairs = [(k, v) for k, v in (query or {}).items() if v is not None and v != ""]
     qs = urllib.parse.urlencode(qs_pairs, doseq=True)
     url = BASE_URL + path + (("?" + qs) if qs else "")
-    req = urllib.request.Request(url, headers={
+    headers = {
         "Authorization": _basic_auth_header(api_key, user),
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = resp.read().decode() or "null"
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError:
-                return body
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise SystemExit(f"HTTP {e.code} on {url}\n{body}")
-    except (socket.timeout, TimeoutError) as e:
-        raise SystemExit(f"timeout (>120s) on {url}: {e}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"network error on {url}: {e}")
-
-
-def request_post(path: str, body: object, api_key: str, user: str = "") -> object:
-    url = BASE_URL + path
-    data = json.dumps(body if body is not None else {}).encode()
-    req = urllib.request.Request(url, data=data, method="POST", headers={
-        "Authorization": _basic_auth_header(api_key, user),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    })
+    }
+    data = None
+    if method in ("POST", "PUT", "PATCH") and body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             text = resp.read().decode() or "null"
@@ -169,11 +170,20 @@ def request_post(path: str, body: object, api_key: str, user: str = "") -> objec
                 return text
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
-        raise SystemExit(f"HTTP {e.code} on POST {url}\n{body_text}")
+        raise SystemExit(f"HTTP {e.code} on {method} {url}\n{body_text}")
     except (socket.timeout, TimeoutError) as e:
-        raise SystemExit(f"timeout (>120s) on POST {url}: {e}")
+        raise SystemExit(f"timeout (>120s) on {method} {url}: {e}")
     except urllib.error.URLError as e:
-        raise SystemExit(f"network error on POST {url}: {e}")
+        raise SystemExit(f"network error on {method} {url}: {e}")
+
+
+# Back-compat shims for the internal helpers.
+def request(path: str, query: dict, api_key: str, user: str = "") -> object:
+    return http_request("GET", path, query=query, api_key=api_key, user=user)
+
+
+def request_post(path: str, body: object, api_key: str, user: str = "") -> object:
+    return http_request("POST", path, body=body, api_key=api_key, user=user)
 
 
 def _items_from_envelope(payload):
@@ -253,16 +263,26 @@ def auto_paginate(meta: dict, query: dict, api_key: str, user: str) -> object:
 
 def cmd_commands(registry: dict) -> None:
     width = max(len(n) for n in registry)
+    counts: dict = {}
     for name in sorted(registry):
         meta = registry[name]
         method = meta.get("method", "GET")
-        print(f"{name:<{width}}  {method:4s} {meta['path']}")
-    print(f"\n{len(registry)} commands. `lemlist help <name>` for details.")
+        counts[method] = counts.get(method, 0) + 1
+        print(f"{name:<{width}}  {method:6s} {meta['path']}")
+    summary = ", ".join(f"{m}: {n}" for m, n in sorted(counts.items()))
+    print(f"\n{len(registry)} commands  ({summary})")
+    print("`lemlist help <name>` for details. POST/PUT/PATCH/DELETE mutate your tenant.")
+
+
+def _is_primitive_schema(s: dict) -> bool:
+    t = s.get("type")
+    return t in ("string", "integer", "number", "boolean")
 
 
 def cmd_help(registry: dict, command: str | None) -> None:
     if not command:
         sys.exit("usage: lemlist help <command>")
+    command = COMMAND_ALIASES.get(command, command)
     if command not in registry:
         sys.exit(f"unknown command: {command}")
     meta = registry[command]
@@ -286,12 +306,29 @@ def cmd_help(registry: dict, command: str | None) -> None:
             desc = (p.get("description") or "").strip().splitlines()
             for line in desc[:3]:
                 print(f"      {line}")
-    if method == "POST":
+    body = meta.get("body")
+    if body or method in ("POST", "PUT", "PATCH"):
         print("\nBody flags:")
-        print("  --body JSON     JSON string for the POST body")
-        print("  --body-file F   path to a JSON file (use - for stdin)")
+        print("  --body JSON     JSON string for the request body")
+        print("  --body-file F   path to a JSON body file (use - for stdin)")
+        if body and body.get("properties"):
+            req_set = set(body.get("required_top") or [])
+            print("\n  Top-level fields from the spec:")
+            for fname, fschema in body["properties"].items():
+                ftype = fschema.get("type") or ("ref" if "$ref" in fschema else "?")
+                req_mark = " (required)" if fname in req_set else ""
+                desc = (fschema.get("description") or "").strip().splitlines()
+                first = desc[0] if desc else ""
+                if _is_primitive_schema(fschema):
+                    print(f"    --{fname}{req_mark}  [{ftype}] {first}")
+                else:
+                    enum = fschema.get("enum")
+                    if enum:
+                        print(f"    --{fname}{req_mark}  [enum: {', '.join(map(str, enum))}] {first}")
+                    else:
+                        print(f"    {fname}{req_mark}  [{ftype}, complex — use --body] {first}")
         if meta.get("default_body") is not None:
-            print(f"  default body:   {json.dumps(meta['default_body'])}")
+            print(f"\n  default body:  {json.dumps(meta['default_body'])}")
     print("\nGlobal flags:")
     print("  --all           auto-paginate (offset/limit or page) — GET only")
     print("  --out PATH      write JSON to file instead of stdout")
@@ -319,9 +356,35 @@ def _autofill_required(meta: dict, query: dict) -> tuple[dict, str | None]:
     return out, None
 
 
+def _coerce_primitive(value: str, schema: dict):
+    """Coerce a CLI string into the JSON type the schema expects."""
+    t = schema.get("type")
+    if t == "integer":
+        return int(value)
+    if t == "number":
+        return float(value)
+    if t == "boolean":
+        return value.lower() in ("true", "1", "yes", "y")
+    return value
+
+
 def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
     meta = registry[name]
     method = meta.get("method", "GET")
+    has_body_method = method in ("POST", "PUT", "PATCH")
+    body_schema = meta.get("body") or {}
+    body_props = body_schema.get("properties") or {}
+    primitive_body_flags = {
+        fname: fschema for fname, fschema in body_props.items()
+        if _is_primitive_schema(fschema)
+    }
+    query_names = {p["name"] for p in meta["query_params"]}
+    # Avoid collision: if a body field has the same name as a query param, the
+    # query param wins (it's directly addressable; body always reachable via --body).
+    primitive_body_flags = {
+        k: v for k, v in primitive_body_flags.items() if k not in query_names
+    }
+
     parser = argparse.ArgumentParser(
         prog=f"lemlist {name}",
         description=meta["summary"],
@@ -334,12 +397,18 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
             required=False,  # required check happens after autofill
             help=(p.get("description") or "").strip(),
         )
-    if method == "POST":
-        parser.add_argument("--body", help="JSON string for the POST body")
+    if has_body_method:
+        parser.add_argument("--body", help="JSON string for the request body")
         parser.add_argument(
             "--body-file",
             help="Path to JSON body file (use - for stdin)",
         )
+        for fname, fschema in primitive_body_flags.items():
+            parser.add_argument(
+                f"--{fname}",
+                required=False,
+                help=(fschema.get("description") or "").strip(),
+            )
     parser.add_argument("--all", action="store_true", help="Auto-paginate all pages (GET only)")
     parser.add_argument("--out", help="Write JSON to file instead of stdout")
     parser.add_argument("--user", default="", help="Basic auth username (default empty)")
@@ -354,8 +423,14 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
         val = getattr(args, p["name"])
         path = path.replace("{" + p["name"] + "}", urllib.parse.quote(str(val), safe=""))
 
-    if method == "POST":
-        body: object
+    query: dict = {}
+    for p in meta["query_params"]:
+        v = getattr(args, p["name"])
+        if v is not None:
+            query[p["name"]] = v
+
+    if has_body_method:
+        body: object | None
         if args.body_file == "-":
             body = json.load(sys.stdin)
         elif args.body_file:
@@ -363,14 +438,25 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
         elif args.body:
             body = json.loads(args.body)
         else:
-            body = meta.get("default_body", {})
-        result = request_post(path, body, api_key, args.user)
-    else:
-        query: dict = {}
-        for p in meta["query_params"]:
-            v = getattr(args, p["name"])
+            body = None
+        # Merge primitive flags into the body (flags take precedence over --body keys).
+        per_field: dict = {}
+        for fname, fschema in primitive_body_flags.items():
+            v = getattr(args, fname.replace("-", "_"), None)
             if v is not None:
-                query[p["name"]] = v
+                per_field[fname] = _coerce_primitive(v, fschema)
+        if per_field:
+            if body is None:
+                body = {}
+            if not isinstance(body, dict):
+                sys.exit("cannot merge --<field> flags into non-dict --body")
+            body = {**body, **per_field}
+        if body is None and meta.get("default_body") is not None:
+            body = meta["default_body"]
+        result = http_request(method, path, query=query, body=body, api_key=api_key, user=args.user)
+    elif method == "DELETE":
+        result = http_request("DELETE", path, query=query, api_key=api_key, user=args.user)
+    else:  # GET
         query, missing = _autofill_required(meta, query)
         if missing:
             sys.exit(f"missing required flag: --{missing}")
@@ -378,7 +464,7 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
         if args.all:
             result = auto_paginate(meta_resolved, query, api_key, args.user)
         else:
-            result = request(path, query, api_key, args.user)
+            result = http_request("GET", path, query=query, api_key=api_key, user=args.user)
 
     out_text = json.dumps(result, indent=2, ensure_ascii=False)
     if args.out:
@@ -523,8 +609,10 @@ def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> None:
     sys.stderr.write("=== Phase 1: list endpoints ===\n")
     for name in sorted(registry):
         meta = registry[name]
-        if meta.get("method", "GET") == "POST":
-            skipped_post.append(name)
+        if meta.get("method", "GET") != "GET":
+            if meta.get("method") == "POST":
+                skipped_post.append(name)
+            # PUT/PATCH/DELETE are write methods — dump-all never touches them.
             continue
         if meta["path_params"]:
             skipped_path.append(name)
@@ -680,25 +768,25 @@ def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> None:
                 if out is not None:
                     _write(dest, out)
 
-    # Phase 7 — POST searches and batch stats
+    # Phase 7 — read-only POST endpoints (search + batch stats)
     if opts["with_search"]:
         sys.stderr.write("\n=== Phase 7: POST search + batch stats ===\n")
-        if "search-people" in registry:
-            meta = registry["search-people"]
+        if "search-people-database" in registry:
+            meta = registry["search-people-database"]
             dest = out_dir / "search" / "people-page1.json"
-            if not _skip_if_exists(dest, "search-people", force, results):
-                out = _try_post(meta["path"], meta.get("default_body", {}), api_key, "search-people", results)
+            if not _skip_if_exists(dest, "search-people-database", force, results):
+                out = _try_post(meta["path"], meta.get("default_body", {}), api_key, "search-people-database", results)
                 if out is not None:
                     _write(dest, out)
-        if "search-companies" in registry:
-            meta = registry["search-companies"]
+        if "search-companies-database" in registry:
+            meta = registry["search-companies-database"]
             dest = out_dir / "search" / "companies-page1.json"
-            if not _skip_if_exists(dest, "search-companies", force, results):
-                out = _try_post(meta["path"], meta.get("default_body", {}), api_key, "search-companies", results)
+            if not _skip_if_exists(dest, "search-companies-database", force, results):
+                out = _try_post(meta["path"], meta.get("default_body", {}), api_key, "search-companies-database", results)
                 if out is not None:
                     _write(dest, out)
         batch_dest = out_dir / "batch-campaign-stats.json"
-        if "batch-campaign-stats" in registry and not _skip_if_exists(batch_dest, "batch-campaign-stats", force, results):
+        if "get-batch-campaign-stats" in registry and not _skip_if_exists(batch_dest, "get-batch-campaign-stats", force, results):
             campaigns = _read_collection(lists_dir / "get-many-campaigns.json")
             cids = [_id_of(c) for c in campaigns if _id_of(c)]
             if cids:
@@ -707,7 +795,7 @@ def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> None:
                 start = end - timedelta(days=365)
                 start_iso = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 end_iso = end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                meta = registry["batch-campaign-stats"]
+                meta = registry["get-batch-campaign-stats"]
                 # Chunk into batches of 100 (lemlist limit)
                 chunks = [cids[i:i + 100] for i in range(0, len(cids), 100)]
                 merged: list = []
@@ -715,7 +803,7 @@ def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> None:
                     body = {"campaignIds": chunk, "startDate": start_iso, "endDate": end_iso}
                     out = _try_post(
                         meta["path"], body, api_key,
-                        f"batch-campaign-stats[chunk {idx + 1}/{len(chunks)}, n={len(chunk)}]",
+                        f"get-batch-campaign-stats[chunk {idx + 1}/{len(chunks)}, n={len(chunk)}]",
                         results,
                     )
                     if out is not None:
@@ -827,6 +915,7 @@ def main() -> None:
         cmd_dump_all(registry, ns.dir, opts)
         return
 
+    cmd = COMMAND_ALIASES.get(cmd, cmd)
     if cmd not in registry:
         sys.exit(f"unknown command: {cmd}\nrun: lemlist commands")
     run_endpoint(registry, cmd, rest)
