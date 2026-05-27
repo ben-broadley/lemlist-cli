@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""lemlist — CLI over the lemlist REST API.
+"""lemlist — unofficial CLI over the lemlist REST API.
+
+Not affiliated with, endorsed by, or sponsored by lemlist S.A.S.
 
 Auto-generated from the OpenAPI spec sitting next to this script (openapi.json).
 Covers every operation in the spec: GET, POST, PUT, PATCH, DELETE.
