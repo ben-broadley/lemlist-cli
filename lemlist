@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+"""lemlist — read-only CLI over the lemlist REST API.
+
+Auto-generated from the OpenAPI spec sitting next to this script (openapi.json).
+Set LEMLIST_API_KEY in your environment. JSON is written to stdout.
+
+Quick start:
+  export LEMLIST_API_KEY=...
+  ./lemlist commands                   # list every available command
+  ./lemlist help get-many-campaigns    # show args/flags for one command
+  ./lemlist get-team
+  ./lemlist get-many-campaigns --status running --all
+  ./lemlist get-campaign cam_xxx
+  ./lemlist dump-all ../lemlist-data   # pull every list endpoint into a folder
+  ./lemlist dump-all ../lemlist-data --with-campaigns  # also drill per-campaign
+
+Auth: lemlist uses HTTP Basic with the API key as the password and an
+empty username. Override with --user if needed.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+SPEC_PATH = Path(__file__).resolve().parent / "openapi.json"
+BASE_URL = "https://api.lemlist.com/api"
+API_KEY_ENV = "LEMLIST_API_KEY"
+USER_AGENT = "lemlist-cli/0.1"
+ENVELOPE_KEYS = (
+    "data", "items", "results",
+    "leads", "campaigns", "activities", "contacts", "companies",
+    "unsubscribes", "tasks", "schedules", "hooks", "messages",
+    "drafts", "labels", "inboxes", "signals",
+)
+
+
+def slugify(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+
+
+def load_spec() -> dict:
+    with SPEC_PATH.open() as f:
+        return json.load(f)
+
+
+def build_registry(spec: dict) -> dict:
+    """Map command name -> operation metadata for every GET endpoint.
+
+    OpenAPI parameters can be declared at the path level (shared across all methods
+    on that path) or the operation level. Merge both — operation-level wins on collision.
+    """
+    registry: dict = {}
+    for path, methods in spec.get("paths", {}).items():
+        path_level = methods.get("parameters", []) or []
+        op = methods.get("get")
+        if not op:
+            continue
+        op_level = op.get("parameters", []) or []
+        seen = {p["name"] for p in op_level}
+        params = op_level + [p for p in path_level if p["name"] not in seen]
+        summary = op.get("summary") or op.get("operationId") or path
+        name = slugify(summary)
+        base, i = name, 2
+        while name in registry:
+            name = f"{base}-{i}"
+            i += 1
+        registry[name] = {
+            "path": path,
+            "summary": summary,
+            "description": op.get("description", "") or "",
+            "path_params": [p for p in params if p.get("in") == "path"],
+            "query_params": [p for p in params if p.get("in") == "query"],
+            "method": "GET",
+        }
+    # Add hand-curated POST endpoints that are reads but documented outside the spec.
+    for name, meta in POST_COMMANDS.items():
+        registry[name] = dict(meta, path_params=[], query_params=[], method="POST")
+    return registry
+
+
+POST_COMMANDS: dict = {
+    "search-people": {
+        "path": "/database/people",
+        "summary": "Search lemlist's People Database (POST with body)",
+        "description": (
+            "POST {\"filters\": [...], \"page\": 1, \"size\": 100} to lemlist's People DB. "
+            "filters[] is required: each item is {filterId, in:[], out:[]}. "
+            "Default body sends an empty filters array — may return zero results "
+            "if lemlist requires at least one filter. Discover valid filterIds via `get-database-filters`."
+        ),
+        "default_body": {"filters": [], "page": 1, "size": 100},
+    },
+    "search-companies": {
+        "path": "/database/companies",
+        "summary": "Search lemlist's Companies Database (POST with body)",
+        "description": (
+            "POST {\"filters\": [...], \"page\": 1, \"size\": 100} to lemlist's Companies DB. "
+            "filters[] is required. Discover valid filterIds via `get-database-filters`."
+        ),
+        "default_body": {"filters": [], "page": 1, "size": 100},
+    },
+    "batch-campaign-stats": {
+        "path": "/v2/campaigns/stats/batch",
+        "summary": "Get stats for many campaigns in one POST (max 100 IDs)",
+        "description": (
+            "POST {\"campaignIds\": [...], \"startDate\": ISO, \"endDate\": ISO}. "
+            "All three are required. Max 100 IDs per call. Used by `dump-all --with-search` "
+            "(chunks IDs and uses a 365-day window ending today)."
+        ),
+        "default_body": None,  # no sensible default — caller must provide
+    },
+}
+
+
+def _basic_auth_header(api_key: str, user: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{api_key}".encode()).decode()
+
+
+def request(path: str, query: dict, api_key: str, user: str = "") -> object:
+    qs_pairs = [(k, v) for k, v in query.items() if v is not None and v != ""]
+    qs = urllib.parse.urlencode(qs_pairs, doseq=True)
+    url = BASE_URL + path + (("?" + qs) if qs else "")
+    req = urllib.request.Request(url, headers={
+        "Authorization": _basic_auth_header(api_key, user),
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = resp.read().decode() or "null"
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                return body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise SystemExit(f"HTTP {e.code} on {url}\n{body}")
+    except (socket.timeout, TimeoutError) as e:
+        raise SystemExit(f"timeout (>120s) on {url}: {e}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"network error on {url}: {e}")
+
+
+def request_post(path: str, body: object, api_key: str, user: str = "") -> object:
+    url = BASE_URL + path
+    data = json.dumps(body if body is not None else {}).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": _basic_auth_header(api_key, user),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            text = resp.read().decode() or "null"
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        raise SystemExit(f"HTTP {e.code} on POST {url}\n{body_text}")
+    except (socket.timeout, TimeoutError) as e:
+        raise SystemExit(f"timeout (>120s) on POST {url}: {e}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"network error on POST {url}: {e}")
+
+
+def _items_from_envelope(payload):
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        for k in ENVELOPE_KEYS:
+            v = payload.get(k)
+            if isinstance(v, list):
+                return v, k
+    return None, None
+
+
+def auto_paginate(meta: dict, query: dict, api_key: str, user: str) -> object:
+    """Walk pagination if the endpoint advertises offset/limit or page."""
+    qnames = {p["name"] for p in meta["query_params"]}
+    path = meta["path"]
+
+    if "offset" in qnames and "limit" in qnames:
+        limit = int(query.get("limit") or 100)
+        query["limit"] = limit
+        offset = int(query.get("offset") or 0)
+        results: list = []
+        envelope_key = None
+        first_payload = None
+        while True:
+            query["offset"] = offset
+            payload = request(path, query, api_key, user)
+            if first_payload is None:
+                first_payload = payload
+            items, key = _items_from_envelope(payload)
+            if items is None:
+                return payload  # not a list-shaped response
+            envelope_key = envelope_key or key
+            results.extend(items)
+            if len(items) < limit:
+                break
+            offset += limit
+            time.sleep(0.05)
+        if envelope_key and isinstance(first_payload, dict):
+            merged = {k: v for k, v in first_payload.items() if k != envelope_key}
+            merged[envelope_key] = results
+            return merged
+        return results
+
+    if "page" in qnames:
+        page_num = int(query.get("page") or 1)
+        limit = int(query.get("limit") or 100)
+        query["limit"] = limit
+        results = []
+        envelope_key = None
+        first_payload = None
+        while True:
+            query["page"] = page_num
+            payload = request(path, query, api_key, user)
+            if first_payload is None:
+                first_payload = payload
+            items, key = _items_from_envelope(payload)
+            if items is None:
+                return payload
+            envelope_key = envelope_key or key
+            if not items:
+                break
+            results.extend(items)
+            if len(items) < limit:
+                break
+            page_num += 1
+            time.sleep(0.05)
+        if envelope_key and isinstance(first_payload, dict):
+            merged = {k: v for k, v in first_payload.items() if k != envelope_key}
+            merged[envelope_key] = results
+            return merged
+        return results
+
+    return request(path, query, api_key, user)
+
+
+def cmd_commands(registry: dict) -> None:
+    width = max(len(n) for n in registry)
+    for name in sorted(registry):
+        meta = registry[name]
+        method = meta.get("method", "GET")
+        print(f"{name:<{width}}  {method:4s} {meta['path']}")
+    print(f"\n{len(registry)} commands. `lemlist help <name>` for details.")
+
+
+def cmd_help(registry: dict, command: str | None) -> None:
+    if not command:
+        sys.exit("usage: lemlist help <command>")
+    if command not in registry:
+        sys.exit(f"unknown command: {command}")
+    meta = registry[command]
+    method = meta.get("method", "GET")
+    print(f"{command}\n  {method} {meta['path']}")
+    if meta["summary"]:
+        print(f"  {meta['summary']}")
+    if meta["description"]:
+        print(f"\n{meta['description'].strip()}\n")
+    if meta["path_params"]:
+        print("Positional arguments:")
+        for p in meta["path_params"]:
+            print(f"  {p['name']:20s} {p.get('description', '').strip()}")
+    if meta["query_params"]:
+        print("\nQuery flags:")
+        for p in meta["query_params"]:
+            req = " (required)" if p.get("required") else ""
+            enum = p.get("schema", {}).get("enum")
+            extra = f" [one of: {', '.join(enum)}]" if enum else ""
+            print(f"  --{p['name']}{req}{extra}")
+            desc = (p.get("description") or "").strip().splitlines()
+            for line in desc[:3]:
+                print(f"      {line}")
+    if method == "POST":
+        print("\nBody flags:")
+        print("  --body JSON     JSON string for the POST body")
+        print("  --body-file F   path to a JSON file (use - for stdin)")
+        if meta.get("default_body") is not None:
+            print(f"  default body:   {json.dumps(meta['default_body'])}")
+    print("\nGlobal flags:")
+    print("  --all           auto-paginate (offset/limit or page) — GET only")
+    print("  --out PATH      write JSON to file instead of stdout")
+    print("  --user NAME     basic-auth username (default: empty)")
+
+
+def _autofill_required(meta: dict, query: dict) -> tuple[dict, str | None]:
+    """Fill in obvious defaults for required query params (e.g. version=v2).
+    Returns (query, missing_param_name_or_None)."""
+    out = dict(query)
+    for p in meta["query_params"]:
+        if not p.get("required"):
+            continue
+        if p["name"] in out:
+            continue
+        schema = p.get("schema", {}) or {}
+        if p["name"] == "version":
+            out["version"] = "v2"
+        elif "default" in schema:
+            out[p["name"]] = schema["default"]
+        elif schema.get("enum"):
+            out[p["name"]] = schema["enum"][0]
+        else:
+            return out, p["name"]
+    return out, None
+
+
+def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
+    meta = registry[name]
+    method = meta.get("method", "GET")
+    parser = argparse.ArgumentParser(
+        prog=f"lemlist {name}",
+        description=meta["summary"],
+    )
+    for p in meta["path_params"]:
+        parser.add_argument(p["name"], help=(p.get("description") or "").strip())
+    for p in meta["query_params"]:
+        parser.add_argument(
+            f"--{p['name']}",
+            required=False,  # required check happens after autofill
+            help=(p.get("description") or "").strip(),
+        )
+    if method == "POST":
+        parser.add_argument("--body", help="JSON string for the POST body")
+        parser.add_argument(
+            "--body-file",
+            help="Path to JSON body file (use - for stdin)",
+        )
+    parser.add_argument("--all", action="store_true", help="Auto-paginate all pages (GET only)")
+    parser.add_argument("--out", help="Write JSON to file instead of stdout")
+    parser.add_argument("--user", default="", help="Basic auth username (default empty)")
+    args = parser.parse_args(argv)
+
+    api_key = os.environ.get(API_KEY_ENV)
+    if not api_key:
+        sys.exit(f"set {API_KEY_ENV} in your environment")
+
+    path = meta["path"]
+    for p in meta["path_params"]:
+        val = getattr(args, p["name"])
+        path = path.replace("{" + p["name"] + "}", urllib.parse.quote(str(val), safe=""))
+
+    if method == "POST":
+        body: object
+        if args.body_file == "-":
+            body = json.load(sys.stdin)
+        elif args.body_file:
+            body = json.loads(Path(args.body_file).read_text())
+        elif args.body:
+            body = json.loads(args.body)
+        else:
+            body = meta.get("default_body", {})
+        result = request_post(path, body, api_key, args.user)
+    else:
+        query: dict = {}
+        for p in meta["query_params"]:
+            v = getattr(args, p["name"])
+            if v is not None:
+                query[p["name"]] = v
+        query, missing = _autofill_required(meta, query)
+        if missing:
+            sys.exit(f"missing required flag: --{missing}")
+        meta_resolved = dict(meta, path=path)
+        if args.all:
+            result = auto_paginate(meta_resolved, query, api_key, args.user)
+        else:
+            result = request(path, query, api_key, args.user)
+
+    out_text = json.dumps(result, indent=2, ensure_ascii=False)
+    if args.out:
+        Path(args.out).write_text(out_text)
+        sys.stderr.write(f"wrote {len(out_text):,} bytes to {args.out}\n")
+    else:
+        print(out_text)
+
+
+# Endpoints whose URL has no path params but which are single-record lookups
+# requiring a query filter (lemlist marks the filter as optional in the spec but
+# the endpoint 404s without it). dump-all skips these in Phase 1.
+LOOKUP_ONLY_COMMANDS = {
+    "get-lead-by-email-or-id",  # /leads — needs --email or --id
+}
+
+# Endpoints excluded from dump-all by default because they're either enormous,
+# slow, or low-signal for the campaign/deliverability analysis use case.
+# Override with --include name1,name2.
+DUMP_EXCLUDED_BY_DEFAULT = {
+    # Mass collections — too large or low-signal for campaign/deliverability analysis
+    "get-many-activities",     # years of activity history; single page can time out
+    "get-many-contacts",       # full contact universe — not needed for campaign/sender analysis
+    "get-many-companies",      # company records — not needed for campaign/deliverability analysis
+    "get-many-unsubscribes",   # individual opt-outs — counts available via /team/credits
+
+    # Unsubscribe-related (low signal — these endpoints kick off async exports, not data)
+    "export-unsubscribes",
+    "export-unsubscribed-contacts",
+    "export-unsubscribed-variables",
+    "list-unsubscribed-variables",
+
+    # lemlist's built-in B2B database (lemleads) — schemas/filters only useful if you use it
+    "get-database-filters",
+    "get-people-schema",
+    "get-companies-schema",
+
+    # Inbox/UX config — not relevant to sender or deliverability analysis
+    "get-user-channels",       # per-user notification prefs
+    "get-many-labels",         # inbox triage labels
+
+    # Slow endpoint, low signal — deliverability is better measured via campaign stats
+    "get-watchlist-signals",
+
+    # Observed broken on some tenants ("Malformed filters" error from lemlist)
+    "get-many-tasks",
+}
+
+# Per-campaign endpoints to skip in Phase 2. Campaign-level metadata + sequences
+# + stats are what matter for content/deliverability analysis; per-lead records
+# are high volume / low signal.
+CAMPAIGN_PHASE_EXCLUDED = {
+    "get-campaign-leads",  # 403 campaigns × N leads = explosion; not needed for the audit
+}
+
+
+def _id_of(obj):
+    if isinstance(obj, dict):
+        return obj.get("_id") or obj.get("id")
+    return None
+
+
+def _count(payload):
+    if isinstance(payload, list):
+        return len(payload)
+    items, _ = _items_from_envelope(payload)
+    if items is not None:
+        return len(items)
+    return 1 if payload else 0
+
+
+def _write(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _read_collection(path: Path) -> list:
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text())
+    if isinstance(payload, list):
+        return payload
+    items, _ = _items_from_envelope(payload)
+    return items or []
+
+
+def _skip_if_exists(path: Path, label: str, force: bool, results: dict) -> bool:
+    """Resume support: skip if destination file already exists (unless --force)."""
+    if not force and path.exists() and path.stat().st_size > 0:
+        sys.stderr.write(f"→ {label} ... cached\n")
+        results.setdefault("cached", []).append(label)
+        return True
+    return False
+
+
+def _try_get(meta: dict, query: dict, api_key: str, label: str, results: dict) -> object | None:
+    sys.stderr.write(f"→ {label} ... ")
+    sys.stderr.flush()
+    try:
+        out = auto_paginate(meta, dict(query), api_key, "")
+        sys.stderr.write(f"ok ({_count(out)})\n")
+        results.setdefault("pulled", []).append(label)
+        return out
+    except SystemExit as e:
+        sys.stderr.write("FAIL\n")
+        for line in str(e).splitlines()[:3]:
+            sys.stderr.write(f"    {line}\n")
+        results.setdefault("failed", []).append((label, str(e)))
+        return None
+
+
+def _try_post(path: str, body: object, api_key: str, label: str, results: dict) -> object | None:
+    sys.stderr.write(f"→ {label} ... ")
+    sys.stderr.flush()
+    try:
+        out = request_post(path, body, api_key, "")
+        sys.stderr.write(f"ok ({_count(out)})\n")
+        results.setdefault("pulled", []).append(label)
+        return out
+    except SystemExit as e:
+        sys.stderr.write("FAIL\n")
+        for line in str(e).splitlines()[:3]:
+            sys.stderr.write(f"    {line}\n")
+        results.setdefault("failed", []).append((label, str(e)))
+        return None
+
+
+def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> None:
+    api_key = os.environ.get(API_KEY_ENV)
+    if not api_key:
+        sys.exit(f"set {API_KEY_ENV} in your environment")
+    out_dir = Path(dir_path)
+    lists_dir = out_dir / "lists"
+    lists_dir.mkdir(parents=True, exist_ok=True)
+
+    results: dict = {"pulled": [], "failed": [], "cached": []}
+    skipped_path, skipped_required, skipped_lookup, skipped_post, skipped_excluded = [], [], [], [], []
+    include_overrides = set(opts.get("include") or [])
+    force = bool(opts.get("force"))
+
+    # Phase 1 — list endpoints (no path params, no required-but-unfillable query, GET only)
+    sys.stderr.write("=== Phase 1: list endpoints ===\n")
+    for name in sorted(registry):
+        meta = registry[name]
+        if meta.get("method", "GET") == "POST":
+            skipped_post.append(name)
+            continue
+        if meta["path_params"]:
+            skipped_path.append(name)
+            continue
+        if name in LOOKUP_ONLY_COMMANDS:
+            skipped_lookup.append(name)
+            continue
+        if name in DUMP_EXCLUDED_BY_DEFAULT and name not in include_overrides:
+            skipped_excluded.append(name)
+            continue
+        query, missing = _autofill_required(meta, {})
+        if missing:
+            skipped_required.append((name, missing))
+            continue
+        dest = lists_dir / f"{name}.json"
+        if _skip_if_exists(dest, name, force, results):
+            continue
+        out = _try_get(meta, query, api_key, name, results)
+        if out is not None:
+            _write(dest, out)
+
+    # Phase 2 — per-campaign drill
+    if opts["with_campaigns"]:
+        sys.stderr.write("\n=== Phase 2: per-campaign drill ===\n")
+        campaigns = _read_collection(lists_dir / "get-many-campaigns.json")
+        camp_endpoints = [
+            n for n, m in registry.items()
+            if m.get("method", "GET") == "GET"
+            and len(m["path_params"]) == 1
+            and m["path_params"][0]["name"] == "campaignId"
+            and n not in CAMPAIGN_PHASE_EXCLUDED
+        ]
+        if CAMPAIGN_PHASE_EXCLUDED:
+            sys.stderr.write(f"(skipping per-campaign: {', '.join(sorted(CAMPAIGN_PHASE_EXCLUDED))})\n")
+        for c in campaigns:
+            cid = _id_of(c)
+            if not cid:
+                continue
+            d = out_dir / "campaigns" / cid
+            for ep_name in camp_endpoints:
+                meta = registry[ep_name]
+                path = meta["path"].replace("{campaignId}", urllib.parse.quote(cid, safe=""))
+                query, missing = _autofill_required(meta, {})
+                if missing:
+                    sys.stderr.write(f"→ campaign {cid}/{ep_name} skipped (needs --{missing})\n")
+                    continue
+                dest = d / f"{ep_name}.json"
+                label = f"campaign/{cid}/{ep_name}"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try_get(dict(meta, path=path), query, api_key, label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 3 — per-user drill
+    if opts["with_users"]:
+        sys.stderr.write("\n=== Phase 3: per-user drill ===\n")
+        team = lists_dir / "get-team.json"
+        team_data = json.loads(team.read_text()) if team.exists() else {}
+        user_ids = team_data.get("userIds", []) if isinstance(team_data, dict) else []
+        for uid in user_ids:
+            d = out_dir / "users" / uid
+            # /users/{userId}
+            if "get-user" in registry:
+                meta = registry["get-user"]
+                path = meta["path"].replace("{userId}", urllib.parse.quote(uid, safe=""))
+                dest = d / "profile.json"
+                label = f"user/{uid}/get-user"
+                if not _skip_if_exists(dest, label, force, results):
+                    out = _try_get(dict(meta, path=path), {}, api_key, label, results)
+                    if out is not None:
+                        _write(dest, out)
+            # /inbox?userId=...
+            if "get-many-inboxes" in registry:
+                meta = registry["get-many-inboxes"]
+                dest = d / "inbox.json"
+                label = f"user/{uid}/inbox"
+                if not _skip_if_exists(dest, label, force, results):
+                    out = _try_get(meta, {"userId": uid}, api_key, label, results)
+                    if out is not None:
+                        _write(dest, out)
+
+        # Per-mailbox lemwarm settings (mailbox IDs come from /team/senders)
+        senders = _read_collection(lists_dir / "get-team-senders.json")
+        if "get-lemwarm-settings" in registry and senders:
+            lw_meta = registry["get-lemwarm-settings"]
+            for s in senders:
+                mid = _id_of(s)
+                if not mid:
+                    continue
+                path = lw_meta["path"].replace("{userMailboxId}", urllib.parse.quote(mid, safe=""))
+                dest = out_dir / "mailboxes" / mid / "lemwarm-settings.json"
+                label = f"mailbox/{mid}/lemwarm"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try_get(dict(lw_meta, path=path), {}, api_key, label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 4 — per-contact-list export
+    if opts["with_lists"]:
+        sys.stderr.write("\n=== Phase 4: per-contact-list export ===\n")
+        lists_data = _read_collection(lists_dir / "get-contact-lists.json")
+        if "export-contact-list" in registry and lists_data:
+            ec_meta = registry["export-contact-list"]
+            for li in lists_data:
+                lid = _id_of(li)
+                if not lid:
+                    continue
+                dest = out_dir / "contact-lists" / f"{lid}.json"
+                label = f"contact-list/{lid}"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try_get(ec_meta, {"listId": lid}, api_key, label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 5 — per-company notes
+    if opts["with_companies"]:
+        sys.stderr.write("\n=== Phase 5: per-company notes ===\n")
+        companies = _read_collection(lists_dir / "get-many-companies.json")
+        if "get-company-notes" in registry and companies:
+            cn_meta = registry["get-company-notes"]
+            for co in companies:
+                co_id = _id_of(co)
+                if not co_id:
+                    continue
+                path = cn_meta["path"].replace("{companyId}", urllib.parse.quote(co_id, safe=""))
+                dest = out_dir / "companies" / co_id / "notes.json"
+                label = f"company/{co_id}/notes"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try_get(dict(cn_meta, path=path), {}, api_key, label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 6 — per-schedule details
+    if opts["with_schedules"]:
+        sys.stderr.write("\n=== Phase 6: per-schedule details ===\n")
+        schedules = _read_collection(lists_dir / "get-many-schedules.json")
+        if "get-schedule" in registry and schedules:
+            s_meta = registry["get-schedule"]
+            for sc in schedules:
+                sid = _id_of(sc)
+                if not sid:
+                    continue
+                path = s_meta["path"].replace("{scheduleId}", urllib.parse.quote(sid, safe=""))
+                dest = out_dir / "schedules" / f"{sid}.json"
+                label = f"schedule/{sid}"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try_get(dict(s_meta, path=path), {}, api_key, label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 7 — POST searches and batch stats
+    if opts["with_search"]:
+        sys.stderr.write("\n=== Phase 7: POST search + batch stats ===\n")
+        if "search-people" in registry:
+            meta = registry["search-people"]
+            dest = out_dir / "search" / "people-page1.json"
+            if not _skip_if_exists(dest, "search-people", force, results):
+                out = _try_post(meta["path"], meta.get("default_body", {}), api_key, "search-people", results)
+                if out is not None:
+                    _write(dest, out)
+        if "search-companies" in registry:
+            meta = registry["search-companies"]
+            dest = out_dir / "search" / "companies-page1.json"
+            if not _skip_if_exists(dest, "search-companies", force, results):
+                out = _try_post(meta["path"], meta.get("default_body", {}), api_key, "search-companies", results)
+                if out is not None:
+                    _write(dest, out)
+        batch_dest = out_dir / "batch-campaign-stats.json"
+        if "batch-campaign-stats" in registry and not _skip_if_exists(batch_dest, "batch-campaign-stats", force, results):
+            campaigns = _read_collection(lists_dir / "get-many-campaigns.json")
+            cids = [_id_of(c) for c in campaigns if _id_of(c)]
+            if cids:
+                from datetime import datetime, timedelta, timezone
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(days=365)
+                start_iso = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                end_iso = end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                meta = registry["batch-campaign-stats"]
+                # Chunk into batches of 100 (lemlist limit)
+                chunks = [cids[i:i + 100] for i in range(0, len(cids), 100)]
+                merged: list = []
+                for idx, chunk in enumerate(chunks):
+                    body = {"campaignIds": chunk, "startDate": start_iso, "endDate": end_iso}
+                    out = _try_post(
+                        meta["path"], body, api_key,
+                        f"batch-campaign-stats[chunk {idx + 1}/{len(chunks)}, n={len(chunk)}]",
+                        results,
+                    )
+                    if out is not None:
+                        # Stats endpoint typically returns a list or dict — collect both
+                        if isinstance(out, list):
+                            merged.extend(out)
+                        else:
+                            merged.append(out)
+                if merged:
+                    _write(
+                        batch_dest,
+                        {"window": {"startDate": start_iso, "endDate": end_iso},
+                         "totalCampaigns": len(cids), "chunks": len(chunks), "results": merged},
+                    )
+
+    pulled = results.get("pulled", [])
+    failed = results.get("failed", [])
+    cached = results.get("cached", [])
+    sys.stderr.write(
+        f"\nDone. pulled={len(pulled)}  cached={len(cached)}  failed={len(failed)}  "
+        f"skipped(path-param)={len(skipped_path)}  "
+        f"skipped(required-flag)={len(skipped_required)}  "
+        f"skipped(lookup)={len(skipped_lookup)}  "
+        f"skipped(POST)={len(skipped_post)}  "
+        f"skipped(excluded)={len(skipped_excluded)}\n"
+    )
+    if skipped_excluded:
+        sys.stderr.write("\nExcluded by default (call directly or use --include):\n")
+        for n in skipped_excluded:
+            sys.stderr.write(f"  {n}\n")
+    if skipped_required:
+        sys.stderr.write("\nSkipped (need a required flag — call directly):\n")
+        for n, m in skipped_required:
+            sys.stderr.write(f"  {n}  (missing --{m})\n")
+    if skipped_lookup:
+        sys.stderr.write("\nSkipped (single-record lookup — call directly with --email or --id):\n")
+        for n in skipped_lookup:
+            sys.stderr.write(f"  {n}\n")
+    if skipped_post and not opts["with_search"]:
+        sys.stderr.write("\nSkipped (POST — rerun with --with-search to include):\n")
+        for n in skipped_post:
+            sys.stderr.write(f"  {n}\n")
+    if skipped_path and not (opts["with_campaigns"] or opts["with_users"] or opts["with_lists"]
+                             or opts["with_companies"] or opts["with_schedules"]):
+        sys.stderr.write(
+            "\nSkipped (need an ID in the path — call directly, or use one of: "
+            "--with-campaigns, --with-users, --with-lists, --with-companies, --with-schedules, --deep):\n"
+        )
+        for n in skipped_path:
+            sys.stderr.write(f"  {n}  ({registry[n]['path']})\n")
+    if failed:
+        sys.stderr.write("\nFailures:\n")
+        for n, err in failed:
+            first = (err.splitlines() or [""])[0]
+            sys.stderr.write(f"  {n}: {first}\n")
+
+
+def main() -> None:
+    spec = load_spec()
+    registry = build_registry(spec)
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        print(f"{len(registry)} commands available. Run: lemlist commands\n")
+        return
+
+    cmd, rest = sys.argv[1], sys.argv[2:]
+
+    if cmd == "commands":
+        cmd_commands(registry)
+        return
+    if cmd == "help":
+        cmd_help(registry, rest[0] if rest else None)
+        return
+    if cmd == "dump-all":
+        sub = argparse.ArgumentParser(prog="lemlist dump-all")
+        sub.add_argument("dir", help="Output directory")
+        sub.add_argument("--with-campaigns", action="store_true",
+                         help="Phase 2: drill into per-campaign endpoints")
+        sub.add_argument("--with-users", action="store_true",
+                         help="Phase 3: per-user profile + inbox + per-mailbox lemwarm")
+        sub.add_argument("--with-lists", action="store_true",
+                         help="Phase 4: export the contents of every contact list")
+        sub.add_argument("--with-companies", action="store_true",
+                         help="Phase 5: per-company notes")
+        sub.add_argument("--with-schedules", action="store_true",
+                         help="Phase 6: full schedule details (the list endpoint already gives a summary)")
+        sub.add_argument("--with-search", action="store_true",
+                         help="Phase 7: POST search-people, search-companies, batch-campaign-stats")
+        sub.add_argument("--deep", action="store_true",
+                         help="Enable all of --with-campaigns/users/lists/companies/schedules/search")
+        sub.add_argument("--include", default="",
+                         help="Comma-separated commands to include even if excluded by default "
+                              "(e.g. --include get-many-activities)")
+        sub.add_argument("--force", action="store_true",
+                         help="Re-fetch endpoints whose output file already exists "
+                              "(default: cached files are skipped, making re-runs resumable)")
+        ns = sub.parse_args(rest)
+        opts = {
+            "with_campaigns": ns.with_campaigns or ns.deep,
+            "with_users":     ns.with_users     or ns.deep,
+            "with_lists":     ns.with_lists     or ns.deep,
+            "with_companies": ns.with_companies or ns.deep,
+            "with_schedules": ns.with_schedules or ns.deep,
+            "with_search":    ns.with_search    or ns.deep,
+            "include":        [s.strip() for s in ns.include.split(",") if s.strip()],
+            "force":          ns.force,
+        }
+        cmd_dump_all(registry, ns.dir, opts)
+        return
+
+    if cmd not in registry:
+        sys.exit(f"unknown command: {cmd}\nrun: lemlist commands")
+    run_endpoint(registry, cmd, rest)
+
+
+if __name__ == "__main__":
+    main()
