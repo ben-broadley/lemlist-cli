@@ -85,10 +85,11 @@ $ ./lemlist get-team
 ### 4. Explore
 
 ```bash
-./lemlist commands                          # list every command + HTTP method
-./lemlist help get-many-campaigns           # show args/flags for one command
+./lemlist commands                                  # list every command + HTTP method
+./lemlist help get-many-campaigns                   # show args/flags for one command
 ./lemlist get-many-campaigns --status running --all
 ./lemlist get-campaign cam_xxx --out cam_xxx.json
+./lemlist update-campaign cam_xxx --name new --dry-run    # preview without sending
 ```
 
 ### 5. Snapshot your whole tenant
@@ -411,6 +412,23 @@ DELETE endpoints take only path params:
 ./lemlist delete-sequence-step seq_xxx stp_xxx
 ```
 
+### Preview before writing
+
+POST / PUT / PATCH / DELETE all support `--dry-run`. The CLI prints the exact request it *would* send (method, URL, headers minus auth, JSON body) and exits without touching lemlist. `--dry-run` doesn't require `LEMLIST_API_KEY` to be set.
+
+```bash
+$ ./lemlist delete-schedule sch_xxx --dry-run
+{
+  "_dry_run": true,
+  "method": "DELETE",
+  "url": "https://api.lemlist.com/api/schedules/sch_xxx",
+  "headers": { ... },
+  "body": null
+}
+```
+
+Combine `--dry-run --verbose` to also stream the request line to stderr in a more terminal-friendly format.
+
 ---
 
 ## Bulk Dump (read-only)
@@ -461,6 +479,15 @@ These flags work on every endpoint command:
 | `--user NAME`      | Basic-auth username (default: empty — lemlist's standard).                                    |
 | `--body JSON`      | JSON string for POST/PUT/PATCH body.                                                          |
 | `--body-file PATH` | Load body from a file. Use `-` for stdin.                                                     |
+| `--verbose`        | Print the HTTP method, URL, and non-auth headers to stderr before sending.                    |
+| `--dry-run`        | (POST/PUT/PATCH/DELETE only.) Print the request that *would* be sent and exit without sending. Doesn't require an API key. |
+
+Top-level flags (run before any command):
+
+| Flag             | Purpose                       |
+| ---------------- | ----------------------------- |
+| `--help`, `-h`   | Show usage and exit.          |
+| `--version`, `-V` | Show CLI version and exit.    |
 
 For POST/PUT/PATCH, the script also adds `--<field>` flags for every primitive top-level body property in the spec (see `./lemlist help <command>`).
 

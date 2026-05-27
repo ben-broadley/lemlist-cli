@@ -17,12 +17,18 @@ Quick start:
   ./lemlist get-campaign cam_xxx
   ./lemlist create-campaign --name "My new campaign" --timezone Australia/Sydney
   ./lemlist update-campaign cam_xxx --body '{"name":"renamed"}'
-  ./lemlist delete-schedule sch_xxx
+  ./lemlist delete-schedule sch_xxx --dry-run    # preview without sending
+  ./lemlist get-team --verbose                   # log the request line to stderr
   ./lemlist dump-all ../lemlist-data   # GET-only bulk snapshot
   ./lemlist dump-all ../lemlist-data --with-campaigns  # also drill per-campaign
 
 Write methods (POST/PUT/PATCH/DELETE) MUTATE your lemlist tenant.
 `dump-all` only hits GET endpoints — it is always read-only.
+Use --dry-run on write methods to preview the request without sending.
+
+Other top-level flags:
+  --version, -V    show CLI version
+  --help, -h       show this help
 
 Auth: lemlist uses HTTP Basic with the API key as the password and an
 empty username. Override with --user if needed.
@@ -32,6 +38,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import difflib
 import os
 import re
 import socket
@@ -42,10 +49,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+VERSION = "0.2.0"
 SPEC_PATH = Path(__file__).resolve().parent / "openapi.json"
 BASE_URL = "https://api.lemlist.com/api"
 API_KEY_ENV = "LEMLIST_API_KEY"
-USER_AGENT = "lemlist-cli/0.1"
+USER_AGENT = f"lemlist-cli/{VERSION}"
 ENVELOPE_KEYS = (
     "data", "items", "results",
     "leads", "campaigns", "activities", "contacts", "companies",
@@ -148,8 +156,15 @@ def http_request(
     body: object = None,
     api_key: str = "",
     user: str = "",
+    verbose: bool = False,
+    dry_run: bool = False,
 ) -> object:
-    """Single HTTP entry point. GET/DELETE ignore `body`; POST/PUT/PATCH send JSON."""
+    """Single HTTP entry point. GET/DELETE ignore `body`; POST/PUT/PATCH send JSON.
+
+    If `dry_run` is True, returns a stand-in dict describing what would have been
+    sent instead of making the network call. The Authorization header is never
+    included in dry-run output or verbose logs.
+    """
     qs_pairs = [(k, v) for k, v in (query or {}).items() if v is not None and v != ""]
     qs = urllib.parse.urlencode(qs_pairs, doseq=True)
     url = BASE_URL + path + (("?" + qs) if qs else "")
@@ -162,6 +177,26 @@ def http_request(
     if method in ("POST", "PUT", "PATCH") and body is not None:
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
+
+    if verbose:
+        # Print method + URL to stderr. Never log the Authorization header.
+        sys.stderr.write(f"→ {method} {url}\n")
+        for hk, hv in headers.items():
+            if hk == "Authorization":
+                continue
+            sys.stderr.write(f"  {hk}: {hv}\n")
+        if data is not None:
+            sys.stderr.write(f"  body: {data.decode()}\n")
+
+    if dry_run:
+        return {
+            "_dry_run": True,
+            "method": method,
+            "url": url,
+            "headers": {k: v for k, v in headers.items() if k != "Authorization"},
+            "body": body if body is not None else None,
+        }
+
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -199,10 +234,13 @@ def _items_from_envelope(payload):
     return None, None
 
 
-def auto_paginate(meta: dict, query: dict, api_key: str, user: str) -> object:
+def auto_paginate(meta: dict, query: dict, api_key: str, user: str, verbose: bool = False) -> object:
     """Walk pagination if the endpoint advertises offset/limit or page."""
     qnames = {p["name"] for p in meta["query_params"]}
     path = meta["path"]
+
+    def _get(q: dict) -> object:
+        return http_request("GET", path, query=q, api_key=api_key, user=user, verbose=verbose)
 
     if "offset" in qnames and "limit" in qnames:
         limit = int(query.get("limit") or 100)
@@ -213,7 +251,7 @@ def auto_paginate(meta: dict, query: dict, api_key: str, user: str) -> object:
         first_payload = None
         while True:
             query["offset"] = offset
-            payload = request(path, query, api_key, user)
+            payload = _get(query)
             if first_payload is None:
                 first_payload = payload
             items, key = _items_from_envelope(payload)
@@ -240,7 +278,7 @@ def auto_paginate(meta: dict, query: dict, api_key: str, user: str) -> object:
         first_payload = None
         while True:
             query["page"] = page_num
-            payload = request(path, query, api_key, user)
+            payload = _get(query)
             if first_payload is None:
                 first_payload = payload
             items, key = _items_from_envelope(payload)
@@ -260,7 +298,7 @@ def auto_paginate(meta: dict, query: dict, api_key: str, user: str) -> object:
             return merged
         return results
 
-    return request(path, query, api_key, user)
+    return _get(query)
 
 
 def cmd_commands(registry: dict) -> None:
@@ -335,6 +373,9 @@ def cmd_help(registry: dict, command: str | None) -> None:
     print("  --all           auto-paginate (offset/limit or page) — GET only")
     print("  --out PATH      write JSON to file instead of stdout")
     print("  --user NAME     basic-auth username (default: empty)")
+    print("  --verbose       print the HTTP request line to stderr before sending")
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        print("  --dry-run       show what would be sent without sending it")
 
 
 def _autofill_required(meta: dict, query: dict) -> tuple[dict, str | None]:
@@ -414,10 +455,16 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
     parser.add_argument("--all", action="store_true", help="Auto-paginate all pages (GET only)")
     parser.add_argument("--out", help="Write JSON to file instead of stdout")
     parser.add_argument("--user", default="", help="Basic auth username (default empty)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print the HTTP method, URL, and non-auth headers to stderr before sending")
+    if has_body_method or method == "DELETE":
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Print the request that would be sent (method, URL, body) without sending it")
     args = parser.parse_args(argv)
+    dry_run = bool(getattr(args, "dry_run", False))
 
-    api_key = os.environ.get(API_KEY_ENV)
-    if not api_key:
+    api_key = os.environ.get(API_KEY_ENV) or ""
+    if not api_key and not dry_run:
         sys.exit(f"set {API_KEY_ENV} in your environment")
 
     path = meta["path"]
@@ -455,18 +502,21 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
             body = {**body, **per_field}
         if body is None and meta.get("default_body") is not None:
             body = meta["default_body"]
-        result = http_request(method, path, query=query, body=body, api_key=api_key, user=args.user)
+        result = http_request(method, path, query=query, body=body, api_key=api_key,
+                              user=args.user, verbose=args.verbose, dry_run=dry_run)
     elif method == "DELETE":
-        result = http_request("DELETE", path, query=query, api_key=api_key, user=args.user)
+        result = http_request("DELETE", path, query=query, api_key=api_key,
+                              user=args.user, verbose=args.verbose, dry_run=dry_run)
     else:  # GET
         query, missing = _autofill_required(meta, query)
         if missing:
             sys.exit(f"missing required flag: --{missing}")
         meta_resolved = dict(meta, path=path)
         if args.all:
-            result = auto_paginate(meta_resolved, query, api_key, args.user)
+            result = auto_paginate(meta_resolved, query, api_key, args.user, verbose=args.verbose)
         else:
-            result = http_request("GET", path, query=query, api_key=api_key, user=args.user)
+            result = http_request("GET", path, query=query, api_key=api_key,
+                                  user=args.user, verbose=args.verbose)
 
     out_text = json.dumps(result, indent=2, ensure_ascii=False)
     if args.out:
@@ -539,8 +589,15 @@ def _count(payload):
 
 
 def _write(path: Path, payload) -> None:
+    """Write JSON to `path` atomically — staged through a sibling .tmp and renamed.
+
+    Survives a Ctrl+C mid-write: the final file either has the complete JSON or
+    doesn't exist (the .tmp may be left behind, but the resume check ignores it).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    os.replace(tmp, path)
 
 
 def _read_collection(path: Path) -> list:
@@ -864,6 +921,10 @@ def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> None:
 
 
 def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-V", "--version"):
+        print(f"lemlist-cli {VERSION}")
+        return
+
     spec = load_spec()
     registry = build_registry(spec)
 
@@ -919,7 +980,12 @@ def main() -> None:
 
     cmd = COMMAND_ALIASES.get(cmd, cmd)
     if cmd not in registry:
-        sys.exit(f"unknown command: {cmd}\nrun: lemlist commands")
+        suggestions = difflib.get_close_matches(cmd, list(registry.keys()), n=3, cutoff=0.6)
+        msg = f"unknown command: {cmd}"
+        if suggestions:
+            msg += "\n\nDid you mean:\n" + "\n".join(f"  {s}" for s in suggestions)
+        msg += "\n\nRun: lemlist commands"
+        sys.exit(msg)
     run_endpoint(registry, cmd, rest)
 
 
