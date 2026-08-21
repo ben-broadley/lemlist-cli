@@ -1,0 +1,1060 @@
+#!/usr/bin/env python3
+"""lem — one CLI over lemlist.
+
+Not affiliated with, endorsed by, or sponsored by lemlist S.A.S.
+"lemlist" is a trademark of lemlist S.A.S.
+
+Three surfaces behind one entry point:
+
+  lem rest ...        the official `@lemlist-official/cli` (REST, 143 operations).
+                      We delegate — we do not reimplement it.
+  lem mcp ...         lemlist's MCP action surface (124 tools), driven as plain
+                      commands. Covers what REST does not: domain purchase and
+                      mailbox provisioning, deliverability audits, inbox placement
+                      tests, AI variable prompts, campaign folders, business
+                      context. No MCP client needed, no 271 KB of tool schemas
+                      loaded into an agent's context.
+  lem dump-all ...    our resumable, GET-only tenant snapshot. Unchanged in spirit
+                      from v0.2, but now driven off the *live* OpenAPI spec
+                      instead of a vendored copy that goes stale.
+
+Quick start:
+  export LEMLIST_API_KEY=...
+  lem doctor                       # check the toolchain end to end
+  lem rest campaigns list          # anything the official CLI can do
+  lem mcp tools --reads            # the read-only MCP surface
+  lem mcp call get_team_info
+  lem dump-all ../lemlist-data     # read-only snapshot, resumable
+
+Safety:
+  `lem rest` inherits the official CLI's own DELETE guard.
+  `lem mcp call` refuses any non-read-only tool without --yes, and refuses the
+  billing/irreversible ones without --force-danger on top.
+  `lem dump-all` only ever issues GET (plus two documented read-only POST
+  searches under --with-search). It cannot mutate your tenant.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.3.0"
+
+API_BASE_URL = "https://api.lemlist.com/api"
+MCP_URL = "https://app.lemlist.com/mcp"
+# The canonical spec lemlist's own CLI reads (101 paths / 143 operations as of
+# 2026-08). The older /api-reference/openapi.json is a stale 65-path snapshot —
+# do not point at it.
+SPEC_URL = "https://developer.lemlist.com/api-reference/openapi/v2.json"
+
+API_KEY_ENV = "LEMLIST_API_KEY"
+USER_AGENT = f"lem/{VERSION}"
+CACHE_DIR = Path(os.environ.get("LEM_CACHE_DIR") or (Path.home() / ".lem"))
+SPEC_TTL_S = 3600
+MCP_TOOLS_TTL_S = 24 * 3600
+OFFICIAL_BIN = os.environ.get("LEMLIST_BIN") or "lemlist"
+
+ENVELOPE_KEYS = (
+    "data", "items", "results",
+    "leads", "campaigns", "activities", "contacts", "companies",
+    "unsubscribes", "tasks", "schedules", "hooks", "messages",
+    "drafts", "labels", "inboxes", "signals",
+)
+METHODS = ("get", "post", "put", "patch", "delete")
+
+
+# --------------------------------------------------------------------------
+# shared helpers
+# --------------------------------------------------------------------------
+
+def die(msg: str, code: int = 1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    raise SystemExit(code)
+
+
+def api_key() -> str:
+    k = os.environ.get(API_KEY_ENV)
+    if not k:
+        die(f"set {API_KEY_ENV} in your environment (or run: lem doctor)")
+    return k
+
+
+def _cache_path(name: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / name
+
+
+def cached_json(name: str, ttl_s: int, fetch, refresh: bool = False):
+    """Read `name` from cache if fresh, else fetch and rewrite it.
+
+    On a fetch failure we fall back to whatever stale copy exists — a snapshot
+    against a slightly old spec beats no snapshot at all.
+    """
+    path = _cache_path(name)
+    if not refresh and path.exists():
+        try:
+            blob = json.loads(path.read_text())
+            if time.time() - blob.get("fetchedAt", 0) < ttl_s:
+                return blob["doc"]
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass
+    try:
+        doc = fetch()
+    except SystemExit:
+        if path.exists():
+            try:
+                sys.stderr.write(f"warning: could not refresh {name}, using cached copy\n")
+                return json.loads(path.read_text())["doc"]
+            except (json.JSONDecodeError, KeyError, OSError):
+                pass
+        raise
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"fetchedAt": time.time(), "doc": doc}))
+    os.replace(tmp, path)
+    return doc
+
+
+def _http(method: str, url: str, headers: dict, data: bytes | None = None, timeout: int = 120):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode() or "null"
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        die(f"HTTP {e.code} on {method} {url}\n{body}")
+    except (socket.timeout, TimeoutError) as e:
+        die(f"timeout (>{timeout}s) on {method} {url}: {e}")
+    except urllib.error.URLError as e:
+        die(f"network error on {method} {url}: {e}")
+
+
+def out_json(payload, compact: bool = False):
+    if isinstance(payload, str):
+        print(payload)
+        return
+    print(json.dumps(payload, ensure_ascii=False) if compact
+          else json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+# --------------------------------------------------------------------------
+# surface 1: rest — delegate to the official CLI
+# --------------------------------------------------------------------------
+
+INSTALL_HINT = (
+    f"official lemlist CLI not found on PATH as `{OFFICIAL_BIN}`.\n"
+    "  install it:  npm install -g @lemlist-official/cli\n"
+    "  or point at it:  export LEMLIST_BIN=/path/to/lemlist"
+)
+
+
+def official_bin() -> str:
+    """Resolve the *official* CLI, not something else named `lemlist`.
+
+    `lemlist` is a crowded name: this repo ships a back-compat shim by that
+    name, and wrappers that inject credentials (BAM ops has one) commonly sit
+    earlier on PATH and exec ours. A naive which() therefore resolves back into
+    us and recurses forever. So: honour LEMLIST_BIN, then prefer a candidate
+    that actually resolves into the @lemlist-official package, and never accept
+    our own shim. LEM_DELEGATING is the backstop the shim checks.
+    """
+    explicit = os.environ.get("LEMLIST_BIN")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            die(f"LEMLIST_BIN is not an executable file: {explicit}", 127)
+        return explicit
+
+    self_shim = (Path(__file__).resolve().parent / "lemlist").resolve()
+    candidates = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d:
+            continue
+        cand = Path(d) / OFFICIAL_BIN
+        if not (cand.is_file() and os.access(cand, os.X_OK)):
+            continue
+        try:
+            real = cand.resolve()
+        except OSError:
+            continue
+        if real == self_shim:
+            continue
+        candidates.append((cand, real))
+
+    for cand, real in candidates:
+        if "@lemlist-official" in str(real):
+            return str(cand)
+    if candidates:
+        return str(candidates[0][0])
+    die(INSTALL_HINT, 127)
+
+
+def cmd_rest(argv: list[str]) -> int:
+    """Pass argv straight through to the official CLI.
+
+    We inject --key from LEMLIST_API_KEY only when the caller has not already
+    chosen a credential (--key / --account) and has not asked for the auth
+    subcommand, so `lem rest auth login` still does the OAuth dance and named
+    profiles keep working untouched.
+    """
+    binpath = official_bin()
+    args = list(argv)
+    chooses_cred = any(a in ("--key", "--account") for a in args)
+    is_auth = bool(args) and args[0] == "auth"
+    key = os.environ.get(API_KEY_ENV)
+    if key and not chooses_cred and not is_auth:
+        args = ["--key", key] + args
+    env = dict(os.environ, LEM_DELEGATING="1")
+    return subprocess.call([binpath] + args, env=env)
+
+
+# --------------------------------------------------------------------------
+# surface 2: mcp — JSON-RPC against lemlist's MCP endpoint
+# --------------------------------------------------------------------------
+
+# Tools that spend money, touch DNS/mailbox infrastructure, send outbound
+# messages, or destroy data. --yes is not enough for these; they also need
+# --force-danger. Everything matched here is judged on the tool's own contract,
+# not on the annotation, because the annotation only says "not read-only".
+DANGER_TOOLS = {
+    "purchase_domain",            # charges the team via Stripe
+    "configure_domain_dns",       # rewrites live DNS
+    "provision_mailboxes",        # creates billable mailboxes
+    "connect_email_account",
+    "disconnect_email_account",   # stops sending immediately, irreversible
+    "send_message",               # sends outbound to a real contact
+    "send_task",
+    "launch_campaign",            # starts real outreach
+    "set_campaign_state",
+    "run_inbox_placement_test",   # sends ~25 seed emails
+    "delete_campaign_leads",
+    "import_leads_to_campaign",
+    "import_contacts_from_csv",
+    "import_companies_from_csv",
+    "add_leads_to_campaign",
+    "generate_campaign_for_watch_list",
+}
+
+
+def mcp_rpc(method: str, params: dict | None = None, timeout: int = 120):
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params or {},
+    }).encode()
+    payload = _http(
+        "POST", MCP_URL,
+        headers={
+            "X-API-Key": api_key(),
+            "Content-Type": "application/json",
+            # The endpoint negotiates plain JSON but advertises SSE; send both.
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": USER_AGENT,
+        },
+        data=body, timeout=timeout,
+    )
+    if isinstance(payload, dict) and payload.get("error"):
+        err = payload["error"]
+        die(f"MCP error {err.get('code')}: {err.get('message')}", 6)
+    return (payload or {}).get("result") if isinstance(payload, dict) else payload
+
+
+def mcp_tools(refresh: bool = False) -> list:
+    doc = cached_json("mcp-tools.json", MCP_TOOLS_TTL_S,
+                      lambda: mcp_rpc("tools/list"), refresh=refresh)
+    return doc.get("tools", []) if isinstance(doc, dict) else []
+
+
+def _is_read_only(tool: dict) -> bool:
+    return bool((tool.get("annotations") or {}).get("readOnlyHint"))
+
+
+def _find_tool(tools: list, name: str) -> dict:
+    for t in tools:
+        if t["name"] == name:
+            return t
+    import difflib
+    near = difflib.get_close_matches(name, [t["name"] for t in tools], n=3, cutoff=0.5)
+    msg = f"unknown MCP tool: {name}"
+    if near:
+        msg += "\n\nDid you mean:\n" + "\n".join(f"  {n}" for n in near)
+    msg += "\n\nRun: lem mcp tools"
+    die(msg, 5)
+
+
+def _coerce(value: str):
+    """Best-effort JSON coercion for --set k=v, falling back to the raw string."""
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _unwrap(result):
+    """MCP returns content[].text holding a JSON string. Unwrap to real JSON."""
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if not isinstance(content, list):
+        return result
+    texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+    if not texts:
+        return result
+    joined = "\n".join(texts)
+    try:
+        return json.loads(joined)
+    except json.JSONDecodeError:
+        return joined
+
+
+def cmd_mcp(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="lem mcp", add_help=True)
+    sub = p.add_subparsers(dest="action", required=True)
+
+    pl = sub.add_parser("tools", help="list the MCP tool surface")
+    pl.add_argument("--reads", action="store_true", help="only read-only tools")
+    pl.add_argument("--writes", action="store_true", help="only mutating tools")
+    pl.add_argument("--search", default="", help="substring filter on name/description")
+    pl.add_argument("--json", action="store_true", help="machine-readable output")
+    pl.add_argument("--refresh", action="store_true", help="bypass the 24h tool cache")
+
+    ph = sub.add_parser("help", help="show one tool's schema")
+    ph.add_argument("tool")
+    ph.add_argument("--json", action="store_true")
+
+    pc = sub.add_parser("call", help="invoke one tool")
+    pc.add_argument("tool")
+    pc.add_argument("--set", action="append", default=[], metavar="K=V",
+                    help="argument; value is parsed as JSON when possible (repeatable)")
+    pc.add_argument("--data", default="", help="full argument object as a JSON string")
+    pc.add_argument("--yes", action="store_true", help="required for any mutating tool")
+    pc.add_argument("--force-danger", action="store_true",
+                    help="additionally required for billing/irreversible tools")
+    pc.add_argument("--dry-run", action="store_true", help="print the request, send nothing")
+    pc.add_argument("--raw", action="store_true", help="do not unwrap content[].text")
+    pc.add_argument("--json", action="store_true", help="compact output")
+
+    ns = p.parse_args(argv)
+
+    if ns.action == "tools":
+        tools = mcp_tools(refresh=ns.refresh)
+        if ns.reads:
+            tools = [t for t in tools if _is_read_only(t)]
+        if ns.writes:
+            tools = [t for t in tools if not _is_read_only(t)]
+        if ns.search:
+            q = ns.search.lower()
+            tools = [t for t in tools
+                     if q in t["name"].lower() or q in t.get("description", "").lower()]
+        if ns.json:
+            out_json([{"name": t["name"], "readOnly": _is_read_only(t),
+                       "danger": t["name"] in DANGER_TOOLS or t["name"].startswith("delete_"),
+                       "description": t.get("description", "").split("\n")[0]}
+                      for t in tools])
+            return 0
+        width = max((len(t["name"]) for t in tools), default=10)
+        for t in sorted(tools, key=lambda x: x["name"]):
+            if t["name"] in DANGER_TOOLS or t["name"].startswith("delete_"):
+                tag = "DANGER"
+            elif _is_read_only(t):
+                tag = "read  "
+            else:
+                tag = "write "
+            first = t.get("description", "").strip().split("\n")[0][:90]
+            print(f"[{tag}] {t['name']:<{width}}  {first}")
+        n_read = sum(1 for t in tools if _is_read_only(t))
+        print(f"\n{len(tools)} tools ({n_read} read-only, {len(tools) - n_read} mutating)")
+        return 0
+
+    tools = mcp_tools()
+
+    if ns.action == "help":
+        t = _find_tool(tools, ns.tool)
+        if ns.json:
+            out_json(t)
+            return 0
+        danger = t["name"] in DANGER_TOOLS or t["name"].startswith("delete_")
+        print(f"{t['name']}  [{'read-only' if _is_read_only(t) else 'MUTATING'}"
+              f"{', DANGER — needs --force-danger' if danger else ''}]\n")
+        print(t.get("description", "").strip())
+        schema = t.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        required = set(schema.get("required") or [])
+        if props:
+            print("\nArguments:")
+            for k, v in props.items():
+                req = " (required)" if k in required else ""
+                typ = v.get("type", "any")
+                desc = (v.get("description") or "").split("\n")[0][:100]
+                print(f"  --set {k}=<{typ}>{req}\n      {desc}" if desc
+                      else f"  --set {k}=<{typ}>{req}")
+        print(f"\nExample:\n  lem mcp call {t['name']}"
+              + ("" if _is_read_only(t) else " --yes")
+              + (" --force-danger" if danger else ""))
+        return 0
+
+    # ns.action == "call"
+    t = _find_tool(tools, ns.tool)
+    args: dict = {}
+    if ns.data:
+        try:
+            parsed = json.loads(ns.data)
+        except json.JSONDecodeError as e:
+            die(f"--data is not valid JSON: {e}")
+        if not isinstance(parsed, dict):
+            die("--data must be a JSON object")
+        args.update(parsed)
+    for pair in ns.set:
+        if "=" not in pair:
+            die(f"--set expects K=V, got: {pair}")
+        k, v = pair.split("=", 1)
+        args[k] = _coerce(v)
+
+    read_only = _is_read_only(t)
+    danger = t["name"] in DANGER_TOOLS or t["name"].startswith("delete_")
+    if not read_only and not ns.yes:
+        die(f"{t['name']} mutates your tenant. Re-run with --yes.\n"
+            f"  inspect it first:  lem mcp help {t['name']}", 1)
+    if danger and not ns.force_danger:
+        die(f"{t['name']} is billing-affecting or irreversible.\n"
+            f"  it needs BOTH --yes and --force-danger.\n"
+            f"  inspect it first:  lem mcp help {t['name']}", 1)
+
+    missing = [k for k in (t.get("inputSchema") or {}).get("required", []) if k not in args]
+    if missing:
+        die(f"{t['name']} requires: {', '.join(missing)}\n"
+            f"  see:  lem mcp help {t['name']}", 1)
+
+    if ns.dry_run:
+        out_json({"_dry_run": True, "url": MCP_URL, "method": "tools/call",
+                  "tool": t["name"], "readOnly": read_only, "danger": danger,
+                  "arguments": args}, compact=ns.json)
+        return 0
+
+    result = mcp_rpc("tools/call", {"name": t["name"], "arguments": args})
+    out_json(result if ns.raw else _unwrap(result), compact=ns.json)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# surface 3: dump-all — resumable, read-only tenant snapshot
+# --------------------------------------------------------------------------
+#
+# Exclusions below are keyed on (METHOD, path), not on the command name the
+# spec's `summary` happens to slugify to. Summaries churn between spec
+# revisions — three of ours were renamed out from under us between the May
+# snapshot and the live spec — while paths are stable. Key on the stable thing.
+
+# No path params, but the endpoint errors without a filter the spec marks
+# optional — so autofill produces a request the API rejects.
+LOOKUP_ONLY_PATHS = {
+    ("GET", "/leads"),                    # needs --email or --id
+    ("GET", "/watchlist/filter-values"),  # needs a non-empty --query
+}
+
+# Skipped by default: enormous, slow, or low-signal for campaign/deliverability
+# analysis. Override per-path with --include.
+DUMP_EXCLUDED_PATHS = {
+    # Mass collections — too large or low-signal
+    ("GET", "/activities"),
+    ("GET", "/contacts"),
+    ("GET", "/companies"),
+    ("GET", "/unsubscribes"),
+    # Async export kickoffs, not data
+    ("GET", "/unsubs/export"),
+    ("GET", "/v2/unsubscribes/exports/contacts"),
+    ("GET", "/v2/unsubscribes/exports/variables"),
+    ("GET", "/v2/unsubscribes/variables"),
+    # lemleads schemas/filters — only useful if you drive the People Database
+    ("GET", "/database/filters"),
+    # Inbox/UX config — irrelevant to sender or deliverability analysis
+    ("GET", "/user/channels"),
+    ("GET", "/inbox/labels"),
+    # Slow, low signal — deliverability reads better from campaign stats
+    ("GET", "/watchlist/signals"),
+    # Observed returning "Malformed filters" on some tenants
+    ("GET", "/tasks"),
+}
+
+# Per-campaign endpoints skipped in Phase 2: N campaigns x M leads explodes.
+CAMPAIGN_PHASE_EXCLUDED_PATHS = {
+    ("GET", "/campaigns/{campaignId}/leads/"),
+}
+
+# Endpoints whose requestBody the spec leaves too open to infer a useful default.
+BODY_DEFAULTS = {
+    ("POST", "/database/people"):    {"filters": [], "page": 1, "size": 100},
+    ("POST", "/database/companies"): {"filters": [], "page": 1, "size": 100},
+}
+
+
+def slugify(s: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+
+
+def fetch_spec(refresh: bool = False) -> dict:
+    def _get():
+        return _http("GET", SPEC_URL,
+                     headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                     timeout=60)
+    return cached_json("openapi.json", SPEC_TTL_S, _get, refresh=refresh)
+
+
+def build_registry(spec: dict) -> dict:
+    """command name -> operation metadata, for every operation in the spec."""
+    registry: dict = {}
+    for path, methods in spec.get("paths", {}).items():
+        path_level = methods.get("parameters", []) or []
+        for method in METHODS:
+            op = methods.get(method)
+            if not op:
+                continue
+            op_level = op.get("parameters", []) or []
+            seen = {p["name"] for p in op_level}
+            params = op_level + [p for p in path_level if p["name"] not in seen]
+            name = slugify(op.get("summary") or op.get("operationId") or path)
+            base, i = name, 2
+            while name in registry:
+                name = f"{base}-{i}"
+                i += 1
+            registry[name] = {
+                "path": path,
+                "method": method.upper(),
+                "key": (method.upper(), path),
+                "summary": op.get("summary") or path,
+                "path_params": [p for p in params if p.get("in") == "path"],
+                "query_params": [p for p in params if p.get("in") == "query"],
+            }
+    return registry
+
+
+def by_key(registry: dict, key: tuple) -> tuple[str, dict] | tuple[None, None]:
+    for name, meta in registry.items():
+        if meta["key"] == key:
+            return name, meta
+    return None, None
+
+
+def rest_request(method: str, path: str, query: dict | None = None,
+                 body: object = None, verbose: bool = False):
+    qs_pairs = [(k, v) for k, v in (query or {}).items() if v is not None and v != ""]
+    qs = urllib.parse.urlencode(qs_pairs, doseq=True)
+    url = API_BASE_URL + path + (("?" + qs) if qs else "")
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(f":{api_key()}".encode()).decode(),
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    data = None
+    if method in ("POST", "PUT", "PATCH") and body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    if verbose:
+        sys.stderr.write(f"→ {method} {url}\n")  # never log Authorization
+    return _http(method, url, headers, data)
+
+
+def _items_from_envelope(payload):
+    """Find the collection inside a list response, or (None, None) for a record.
+
+    A single record can carry a field that happens to be named like an envelope
+    — GET /team returns a team object with its own `labels: []` — and treating
+    that as the collection both miscounts the result and, on a paginated
+    endpoint, would page over the wrong array. A record has a top-level
+    identity; a wrapper does not. Use that to tell them apart.
+    """
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        if payload.get("_id") or payload.get("id"):
+            return None, None
+        for k in ENVELOPE_KEYS:
+            v = payload.get(k)
+            if isinstance(v, list):
+                return v, k
+    return None, None
+
+
+def auto_paginate(meta: dict, query: dict, verbose: bool = False):
+    """Walk pagination when the endpoint advertises offset/limit or page."""
+    qnames = {p["name"] for p in meta["query_params"]}
+    path = meta["path"]
+    use_offset = "offset" in qnames and "limit" in qnames
+    use_page = (not use_offset) and "page" in qnames
+    if not (use_offset or use_page):
+        return rest_request("GET", path, query, verbose=verbose)
+
+    limit = int(query.get("limit") or 100)
+    query["limit"] = limit
+    cursor = int(query.get("offset") or 0) if use_offset else int(query.get("page") or 1)
+    results: list = []
+    envelope_key = None
+    first_payload = None
+    while True:
+        query["offset" if use_offset else "page"] = cursor
+        payload = rest_request("GET", path, query, verbose=verbose)
+        if first_payload is None:
+            first_payload = payload
+        items, key = _items_from_envelope(payload)
+        if items is None:
+            return payload  # not list-shaped
+        envelope_key = envelope_key or key
+        if not items:
+            break
+        results.extend(items)
+        if len(items) < limit:
+            break
+        cursor += limit if use_offset else 1
+        time.sleep(0.05)
+    if envelope_key and isinstance(first_payload, dict):
+        merged = {k: v for k, v in first_payload.items() if k != envelope_key}
+        merged[envelope_key] = results
+        return merged
+    return results
+
+
+def _autofill_required(meta: dict, query: dict) -> tuple[dict, str | None]:
+    out = dict(query)
+    for p in meta["query_params"]:
+        if not p.get("required") or p["name"] in out:
+            continue
+        schema = p.get("schema", {}) or {}
+        if p["name"] == "version":
+            out["version"] = "v2"
+        elif "default" in schema:
+            out[p["name"]] = schema["default"]
+        elif schema.get("enum"):
+            out[p["name"]] = schema["enum"][0]
+        else:
+            return out, p["name"]
+    return out, None
+
+
+def _id_of(obj):
+    return obj.get("_id") or obj.get("id") if isinstance(obj, dict) else None
+
+
+def _count(payload):
+    if isinstance(payload, list):
+        return len(payload)
+    items, _ = _items_from_envelope(payload)
+    if items is not None:
+        return len(items)
+    return 1 if payload else 0
+
+
+def _write(path: Path, payload) -> None:
+    """Atomic write — staged through a sibling .tmp and renamed.
+
+    Survives Ctrl+C mid-write: the destination is either complete JSON or absent,
+    which is what makes --force-less re-runs safely resumable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    os.replace(tmp, path)
+
+
+def _read_collection(path: Path) -> list:
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text())
+    if isinstance(payload, list):
+        return payload
+    items, _ = _items_from_envelope(payload)
+    return items or []
+
+
+def _skip_if_exists(path: Path, label: str, force: bool, results: dict) -> bool:
+    if not force and path.exists() and path.stat().st_size > 0:
+        sys.stderr.write(f"→ {label} ... cached\n")
+        results.setdefault("cached", []).append(label)
+        return True
+    return False
+
+
+def _try(fn, label: str, results: dict):
+    sys.stderr.write(f"→ {label} ... ")
+    sys.stderr.flush()
+    try:
+        out = fn()
+        sys.stderr.write(f"ok ({_count(out)})\n")
+        results.setdefault("pulled", []).append(label)
+        return out
+    except SystemExit as e:
+        sys.stderr.write("FAIL\n")
+        for line in str(e).splitlines()[:3]:
+            sys.stderr.write(f"    {line}\n")
+        results.setdefault("failed", []).append((label, str(e)))
+        return None
+
+
+def cmd_dump_all(registry: dict, dir_path: str, opts: dict) -> int:
+    api_key()  # fail fast before creating directories
+    out_dir = Path(dir_path)
+    lists_dir = out_dir / "lists"
+    lists_dir.mkdir(parents=True, exist_ok=True)
+
+    results: dict = {"pulled": [], "failed": [], "cached": []}
+    skipped_path, skipped_required, skipped_lookup, skipped_write, skipped_excluded = [], [], [], [], []
+    include = set(opts.get("include") or [])
+    force = bool(opts.get("force"))
+
+    sys.stderr.write("=== Phase 1: list endpoints ===\n")
+    for name in sorted(registry):
+        meta = registry[name]
+        key = meta["key"]
+        if meta["method"] != "GET":
+            skipped_write.append(name)
+            continue
+        if meta["path_params"]:
+            skipped_path.append(name)
+            continue
+        if key in LOOKUP_ONLY_PATHS:
+            skipped_lookup.append(name)
+            continue
+        if key in DUMP_EXCLUDED_PATHS and name not in include and meta["path"] not in include:
+            skipped_excluded.append(name)
+            continue
+        query, missing = _autofill_required(meta, {})
+        if missing:
+            skipped_required.append((name, missing))
+            continue
+        dest = lists_dir / f"{name}.json"
+        if _skip_if_exists(dest, name, force, results):
+            continue
+        out = _try(lambda m=meta, q=query: auto_paginate(m, dict(q)), name, results)
+        if out is not None:
+            _write(dest, out)
+
+    campaigns_name, _ = by_key(registry, ("GET", "/campaigns"))
+    team_name, _ = by_key(registry, ("GET", "/team"))
+
+    # Phase 2 — per-campaign drill
+    if opts["with_campaigns"]:
+        sys.stderr.write("\n=== Phase 2: per-campaign drill ===\n")
+        campaigns = _read_collection(lists_dir / f"{campaigns_name}.json") if campaigns_name else []
+        camp_endpoints = [
+            (n, m) for n, m in registry.items()
+            if m["method"] == "GET"
+            and len(m["path_params"]) == 1
+            and m["path_params"][0]["name"] == "campaignId"
+            and m["key"] not in CAMPAIGN_PHASE_EXCLUDED_PATHS
+        ]
+        for c in campaigns:
+            cid = _id_of(c)
+            if not cid:
+                continue
+            for ep_name, meta in camp_endpoints:
+                path = meta["path"].replace("{campaignId}", urllib.parse.quote(cid, safe=""))
+                query, missing = _autofill_required(meta, {})
+                if missing:
+                    continue
+                dest = out_dir / "campaigns" / cid / f"{ep_name}.json"
+                label = f"campaign/{cid}/{ep_name}"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try(lambda m=dict(meta, path=path), q=query: auto_paginate(m, dict(q)),
+                           label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 3 — per-user drill
+    if opts["with_users"]:
+        sys.stderr.write("\n=== Phase 3: per-user drill ===\n")
+        team_file = lists_dir / f"{team_name}.json" if team_name else None
+        team_data = json.loads(team_file.read_text()) if team_file and team_file.exists() else {}
+        user_ids = team_data.get("userIds", []) if isinstance(team_data, dict) else []
+        user_n, user_m = by_key(registry, ("GET", "/users/{userId}"))
+        inbox_n, inbox_m = by_key(registry, ("GET", "/inbox"))
+        for uid in user_ids:
+            d = out_dir / "users" / uid
+            if user_m:
+                path = user_m["path"].replace("{userId}", urllib.parse.quote(uid, safe=""))
+                label = f"user/{uid}/profile"
+                if not _skip_if_exists(d / "profile.json", label, force, results):
+                    out = _try(lambda m=dict(user_m, path=path): auto_paginate(m, {}), label, results)
+                    if out is not None:
+                        _write(d / "profile.json", out)
+            if inbox_m:
+                label = f"user/{uid}/inbox"
+                if not _skip_if_exists(d / "inbox.json", label, force, results):
+                    out = _try(lambda m=inbox_m: auto_paginate(m, {"userId": uid}), label, results)
+                    if out is not None:
+                        _write(d / "inbox.json", out)
+
+        senders_n, _ = by_key(registry, ("GET", "/team/senders"))
+        lw_n, lw_m = by_key(registry, ("GET", "/lemwarm/{userMailboxId}/settings"))
+        senders = _read_collection(lists_dir / f"{senders_n}.json") if senders_n else []
+        if lw_m and senders:
+            for s in senders:
+                mid = _id_of(s)
+                if not mid:
+                    continue
+                path = lw_m["path"].replace("{userMailboxId}", urllib.parse.quote(mid, safe=""))
+                dest = out_dir / "mailboxes" / mid / "lemwarm-settings.json"
+                label = f"mailbox/{mid}/lemwarm"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try(lambda m=dict(lw_m, path=path): auto_paginate(m, {}), label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 4 — per-contact-list export
+    if opts["with_lists"]:
+        sys.stderr.write("\n=== Phase 4: per-contact-list export ===\n")
+        cl_n, _ = by_key(registry, ("GET", "/contacts/lists"))
+        ex_n, ex_m = by_key(registry, ("GET", "/contacts/lists/{listId}/entities"))
+        lists_data = _read_collection(lists_dir / f"{cl_n}.json") if cl_n else []
+        if ex_m:
+            for li in lists_data:
+                lid = _id_of(li)
+                if not lid:
+                    continue
+                path = ex_m["path"].replace("{listId}", urllib.parse.quote(lid, safe=""))
+                dest = out_dir / "contact-lists" / f"{lid}.json"
+                label = f"contact-list/{lid}"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try(lambda m=dict(ex_m, path=path): auto_paginate(m, {}), label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 5 — per-company notes
+    if opts["with_companies"]:
+        sys.stderr.write("\n=== Phase 5: per-company notes ===\n")
+        co_n, _ = by_key(registry, ("GET", "/companies"))
+        nt_n, nt_m = by_key(registry, ("GET", "/companies/{companyId}/notes"))
+        companies = _read_collection(lists_dir / f"{co_n}.json") if co_n else []
+        if nt_m:
+            for co in companies:
+                cid = _id_of(co)
+                if not cid:
+                    continue
+                path = nt_m["path"].replace("{companyId}", urllib.parse.quote(cid, safe=""))
+                dest = out_dir / "companies" / cid / "notes.json"
+                label = f"company/{cid}/notes"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try(lambda m=dict(nt_m, path=path): auto_paginate(m, {}), label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 6 — per-schedule details
+    if opts["with_schedules"]:
+        sys.stderr.write("\n=== Phase 6: per-schedule details ===\n")
+        sl_n, _ = by_key(registry, ("GET", "/schedules"))
+        sd_n, sd_m = by_key(registry, ("GET", "/schedules/{scheduleId}"))
+        schedules = _read_collection(lists_dir / f"{sl_n}.json") if sl_n else []
+        if sd_m:
+            for sc in schedules:
+                sid = _id_of(sc)
+                if not sid:
+                    continue
+                path = sd_m["path"].replace("{scheduleId}", urllib.parse.quote(sid, safe=""))
+                dest = out_dir / "schedules" / f"{sid}.json"
+                label = f"schedule/{sid}"
+                if _skip_if_exists(dest, label, force, results):
+                    continue
+                out = _try(lambda m=dict(sd_m, path=path): auto_paginate(m, {}), label, results)
+                if out is not None:
+                    _write(dest, out)
+
+    # Phase 7 — the two read-only POST searches + batch campaign stats
+    if opts["with_search"]:
+        sys.stderr.write("\n=== Phase 7: POST search + batch stats ===\n")
+        for key, fname in ((("POST", "/database/people"), "people-page1.json"),
+                           (("POST", "/database/companies"), "companies-page1.json")):
+            n, m = by_key(registry, key)
+            if not m:
+                continue
+            dest = out_dir / "search" / fname
+            if _skip_if_exists(dest, n, force, results):
+                continue
+            body = BODY_DEFAULTS.get(key, {})
+            out = _try(lambda p=m["path"], b=body: rest_request("POST", p, body=b), n, results)
+            if out is not None:
+                _write(dest, out)
+
+        bs_n, bs_m = by_key(registry, ("POST", "/v2/campaigns/stats/batch"))
+        batch_dest = out_dir / "batch-campaign-stats.json"
+        if bs_m and not _skip_if_exists(batch_dest, bs_n, force, results):
+            campaigns = _read_collection(lists_dir / f"{campaigns_name}.json") if campaigns_name else []
+            cids = [_id_of(c) for c in campaigns if _id_of(c)]
+            if cids:
+                from datetime import datetime, timedelta, timezone
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(days=365)
+                start_iso = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                end_iso = end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                chunks = [cids[i:i + 100] for i in range(0, len(cids), 100)]
+                merged: list = []
+                for idx, chunk in enumerate(chunks):
+                    body = {"campaignIds": chunk, "startDate": start_iso, "endDate": end_iso}
+                    out = _try(lambda p=bs_m["path"], b=body: rest_request("POST", p, body=b),
+                               f"{bs_n}[chunk {idx + 1}/{len(chunks)}, n={len(chunk)}]", results)
+                    if out is not None:
+                        merged.extend(out) if isinstance(out, list) else merged.append(out)
+                if merged:
+                    _write(batch_dest, {"window": {"startDate": start_iso, "endDate": end_iso},
+                                        "totalCampaigns": len(cids), "chunks": len(chunks),
+                                        "results": merged})
+
+    pulled, failed, cached = results.get("pulled", []), results.get("failed", []), results.get("cached", [])
+    sys.stderr.write(
+        f"\nDone. pulled={len(pulled)}  cached={len(cached)}  failed={len(failed)}  "
+        f"skipped(path-param)={len(skipped_path)}  skipped(required-flag)={len(skipped_required)}  "
+        f"skipped(lookup)={len(skipped_lookup)}  skipped(write-method)={len(skipped_write)}  "
+        f"skipped(excluded)={len(skipped_excluded)}\n"
+    )
+    if skipped_excluded:
+        sys.stderr.write("\nExcluded by default (add with --include <name>):\n")
+        for n in skipped_excluded:
+            sys.stderr.write(f"  {n}\n")
+    if skipped_required:
+        sys.stderr.write("\nSkipped (needs a required flag — call via `lem rest`):\n")
+        for n, m in skipped_required:
+            sys.stderr.write(f"  {n}  (missing --{m})\n")
+    if failed:
+        sys.stderr.write("\nFailures:\n")
+        for n, err in failed:
+            sys.stderr.write(f"  {n}: {(err.splitlines() or [''])[0]}\n")
+    return 1 if failed else 0
+
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+
+def cmd_doctor() -> int:
+    ok = True
+
+    def line(label, status, detail=""):
+        mark = "ok  " if status else "FAIL"
+        print(f"[{mark}] {label}" + (f"  — {detail}" if detail else ""))
+
+    print(f"lem {VERSION}\n")
+
+    line("python", True, f"{sys.version_info.major}.{sys.version_info.minor}")
+
+    found = shutil.which(OFFICIAL_BIN)
+    if found:
+        try:
+            v = subprocess.run([found, "--version"], capture_output=True, text=True,
+                               timeout=30).stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            v = "unknown version"
+        line("official lemlist CLI", True, f"{found} ({v})")
+    else:
+        ok = False
+        line("official lemlist CLI", False, "not on PATH — npm i -g @lemlist-official/cli")
+
+    has_key = bool(os.environ.get(API_KEY_ENV))
+    line(f"{API_KEY_ENV}", has_key, "set" if has_key else "not set")
+    ok = ok and has_key
+
+    try:
+        spec = fetch_spec()
+        n_paths = len(spec.get("paths", {}))
+        n_ops = sum(1 for p in spec["paths"].values() for m in p if m in METHODS)
+        line("live OpenAPI spec", True, f"{n_paths} paths / {n_ops} operations")
+    except SystemExit:
+        ok = False
+        line("live OpenAPI spec", False, SPEC_URL)
+
+    if has_key:
+        try:
+            tools = mcp_tools()
+            n_read = sum(1 for t in tools if _is_read_only(t))
+            line("MCP endpoint", True,
+                 f"{len(tools)} tools ({n_read} read-only, {len(tools) - n_read} mutating)")
+        except SystemExit:
+            ok = False
+            line("MCP endpoint", False, MCP_URL)
+    else:
+        line("MCP endpoint", False, f"skipped — needs {API_KEY_ENV}")
+
+    print(f"\ncache: {CACHE_DIR}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+USAGE = """lem — one CLI over lemlist
+
+  lem rest <args...>        the official lemlist CLI (REST, 143 operations)
+  lem mcp tools             list the MCP action surface
+  lem mcp help <tool>       one tool's schema and safety class
+  lem mcp call <tool> ...   invoke an MCP tool
+  lem dump-all <dir>        resumable, read-only tenant snapshot
+  lem doctor                check the toolchain end to end
+  lem --version
+
+Run `lem rest --help` for the REST surface, `lem mcp --help` for the MCP one.
+"""
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        print(USAGE)
+        return
+    if argv[0] in ("-V", "--version"):
+        print(f"lem {VERSION}")
+        return
+
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "rest":
+        raise SystemExit(cmd_rest(rest))
+    if cmd == "mcp":
+        raise SystemExit(cmd_mcp(rest))
+    if cmd == "doctor":
+        raise SystemExit(cmd_doctor())
+    if cmd == "dump-all":
+        p = argparse.ArgumentParser(prog="lem dump-all")
+        p.add_argument("dir", help="output directory")
+        p.add_argument("--with-campaigns", action="store_true", help="Phase 2: per-campaign endpoints")
+        p.add_argument("--with-users", action="store_true", help="Phase 3: per-user profile, inbox, lemwarm")
+        p.add_argument("--with-lists", action="store_true", help="Phase 4: contact-list contents")
+        p.add_argument("--with-companies", action="store_true", help="Phase 5: per-company notes")
+        p.add_argument("--with-schedules", action="store_true", help="Phase 6: full schedule details")
+        p.add_argument("--with-search", action="store_true", help="Phase 7: read-only POST searches + batch stats")
+        p.add_argument("--deep", action="store_true", help="enable every phase above")
+        p.add_argument("--include", default="", help="comma-separated commands to pull despite being excluded")
+        p.add_argument("--force", action="store_true", help="re-fetch even when the output file exists")
+        p.add_argument("--refresh-spec", action="store_true", help="bypass the 1h OpenAPI cache")
+        ns = p.parse_args(rest)
+        registry = build_registry(fetch_spec(refresh=ns.refresh_spec))
+        opts = {
+            "with_campaigns": ns.with_campaigns or ns.deep,
+            "with_users":     ns.with_users     or ns.deep,
+            "with_lists":     ns.with_lists     or ns.deep,
+            "with_companies": ns.with_companies or ns.deep,
+            "with_schedules": ns.with_schedules or ns.deep,
+            "with_search":    ns.with_search    or ns.deep,
+            "include":        [s.strip() for s in ns.include.split(",") if s.strip()],
+            "force":          ns.force,
+        }
+        raise SystemExit(cmd_dump_all(registry, ns.dir, opts))
+
+    die(f"unknown command: {cmd}\n\n{USAGE}", 1)
+
+
+if __name__ == "__main__":
+    main()
