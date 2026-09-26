@@ -1,567 +1,204 @@
-# lemlist CLI
+# lem
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
 
-> A stdlib-only Python CLI for the [lemlist](https://lemlist.com) REST API. Auto-generated from the published OpenAPI spec — covers every operation lemlist documents (120 commands across GET / POST / PUT / PATCH / DELETE).
+> One CLI over lemlist: the official REST CLI, lemlist's MCP action surface, and a resumable read-only tenant snapshot — behind a single entry point. Stdlib-only Python 3, no dependencies of its own.
 
 > [!IMPORTANT]
-> **Unofficial.** This is an independent open-source project and is **not affiliated with, endorsed by, or sponsored by lemlist S.A.S.** "lemlist" is a trademark of lemlist S.A.S.; use of the name here refers only to the public API this tool talks to.
-
-> [!WARNING]
-> This CLI can mutate your tenant. POST / PUT / PATCH / DELETE commands write to lemlist. The `dump-all` subcommand is read-only (GET only) — safe to run any time.
+> **Unofficial.** An independent open-source project, **not affiliated with, endorsed by, or sponsored by lemlist S.A.S.** "lemlist" is a trademark of lemlist S.A.S.; use of the name here refers only to the public API and MCP endpoint this tool talks to.
 
 ---
 
-## Table of Contents
+## Why this exists
 
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Authentication](#authentication)
-- [Output Conventions](#output-conventions)
-- [Commands by Domain](#commands-by-domain)
-- [Write Methods](#write-methods)
-- [Bulk Dump (read-only)](#bulk-dump-read-only)
-- [Global Options](#global-options)
-- [Exit Codes](#exit-codes)
-- [Updating the Spec](#updating-the-spec)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
-- [Bug Reports](#bug-reports)
-- [License](#license)
+lemlist ships two surfaces, and neither one covers the job on its own.
+
+- **The official CLI** (`@lemlist-official/cli`) is good, and it beats what this repo used to be: it generates its commands from the *live* OpenAPI spec, so it never goes stale. **Use it. We delegate to it rather than racing it.**
+- **The MCP server** is not a subset of the REST API — it's a different, larger surface. 124 tools, and a chunk of them have no REST endpoint at all: domain purchase, mailbox provisioning, deliverability audits, inbox placement tests, AI variable prompts, campaign folders, business context.
+
+So you need both. But wiring up the MCP costs you **271 KB of tool schemas — roughly 65k tokens — loaded into an agent's context before it does anything.** `lem` drives the same MCP endpoint as plain commands: no MCP client, no schema tax, and the tools stay discoverable via `lem mcp tools`.
+
+Plus the one thing that was always ours: `dump-all`, a resumable GET-only snapshot of a whole tenant.
+
+## The three surfaces
+
+| | what it is | backed by |
+|---|---|---|
+| `lem rest ...` | 143 REST operations | delegates to `@lemlist-official/cli` |
+| `lem mcp ...` | 124 MCP actions | direct JSON-RPC to `app.lemlist.com/mcp` |
+| `lem dump-all ...` | resumable read-only snapshot | live OpenAPI spec, direct HTTP |
 
 ---
 
 ## Installation
 
-Requires **Python 3** (any recent version). Zero external dependencies.
+Requires **Python 3** and **Node.js 20+** (the latter for the official CLI we delegate to).
 
 ```bash
+npm install -g @lemlist-official/cli
 git clone https://github.com/ben-broadley/lemlist-cli.git
 cd lemlist-cli
-./lemlist commands
+ln -s "$(pwd)/lem" ~/.local/bin/lem
 ```
 
-Optionally put it on your `PATH`:
+Get your API key from lemlist (**Settings → Integrations → API**), then:
 
 ```bash
-ln -s "$(pwd)/lemlist" ~/.local/bin/lemlist
+export LEMLIST_API_KEY=...
+lem doctor
+```
+
+`lem doctor` checks all five moving parts and tells you which one is unhappy:
+
+```
+lem 0.3.0
+
+[ok  ] python  — 3.14
+[ok  ] official lemlist CLI  — /opt/homebrew/bin/lemlist (0.3.1)
+[ok  ] LEMLIST_API_KEY  — set
+[ok  ] live OpenAPI spec  — 101 paths / 143 operations
+[ok  ] MCP endpoint  — 124 tools (59 read-only, 65 mutating)
 ```
 
 ---
 
-## Quick Start
+## `lem rest` — the REST surface
 
-### 1. Get your API key
-
-In lemlist, go to **Settings → Integrations → API** and copy your key.
-
-### 2. Export it
+Straight pass-through to the official CLI, with `--key` injected from `LEMLIST_API_KEY` so you don't have to think about it.
 
 ```bash
-export LEMLIST_API_KEY="your_key_here"
+lem rest campaigns list
+lem rest api GET /campaigns
+lem rest --json team members | jq '.members[] | {email, role}'
 ```
 
-For repeat use, drop it into a `0600` file you can `source`:
-
-```bash
-echo 'export LEMLIST_API_KEY="your_key_here"' > ~/.lemlist.env
-chmod 600 ~/.lemlist.env
-source ~/.lemlist.env
-```
-
-### 3. Verify
-
-```bash
-$ ./lemlist get-team
-{
-  "_id": "tea_xxxxxxxxxxxxxxxxx",
-  "name": "Acme Outreach",
-  "userIds": ["usr_aaa", "usr_bbb", ...],
-  "settings": { ... }
-}
-```
-
-### 4. Explore
-
-```bash
-./lemlist commands                                  # list every command + HTTP method
-./lemlist help get-many-campaigns                   # show args/flags for one command
-./lemlist get-many-campaigns --status running --all
-./lemlist get-campaign cam_xxx --out cam_xxx.json
-./lemlist update-campaign cam_xxx --name new --dry-run    # preview without sending
-```
-
-### 5. Snapshot your whole tenant
-
-```bash
-./lemlist dump-all dumps/2026-05-04 --deep
-```
+Named profiles and OAuth still work — `lem rest auth login`, `lem rest --account client-x campaigns list`. We only inject the key when you haven't chosen a credential yourself.
 
 ---
 
-## Authentication
+## `lem mcp` — the MCP action surface
 
-The CLI resolves your API key in this order:
+```bash
+lem mcp tools                          # all 124, tagged read / write / DANGER
+lem mcp tools --reads                  # just the safe ones
+lem mcp tools --search deliverability  # filter by name or description
+lem mcp help check_domain_health       # schema, arguments, safety class
+lem mcp call get_team_info
+lem mcp call check_domain_health --set scope=team
+```
 
-| Priority | Method                            | Example                                              |
-| -------- | --------------------------------- | ---------------------------------------------------- |
-| 1        | `LEMLIST_API_KEY` environment var | `export LEMLIST_API_KEY=xxx && ./lemlist get-team`   |
-| 2        | Sourced env file                  | `source ~/.lemlist.env && ./lemlist get-team`        |
+Arguments go in via `--set k=v` (values are parsed as JSON when they parse, so `--set ids='["a","b"]'` and `--set limit=10` do what you want), or as a whole object via `--data '{...}'`.
 
-lemlist uses **HTTP Basic auth** with the API key as the password and an empty username. The CLI handles this transparently. Override the username with `--user NAME` if needed (rarely required).
+The tool list is cached for 24h in `~/.lem/`; `--refresh` re-reads it, so tools lemlist ships tomorrow show up without a release here.
+
+### Coverage
+
+**All 124 tools, no allowlist.** The command surface *is* `tools/list` — there are no hand-written wrappers to fall behind. Verified against a live tenant: 124/124 resolve and render their schema, and 32/32 of the read-only zero-argument set execute and return real data.
+
+Two caveats worth knowing:
+
+- **The schemas under-declare.** Several tools ship `required: []` but enforce an either/or rule server-side — `get_campaign_details` wants exactly one of `campaignId` or `campaignIds`. Nothing in the schema says so, so `lem` can't pre-validate it. The server's rejection is relayed verbatim and does explain the fix.
+- **Workspace tools degrade headless.** `display_leads`, `display_table` and `propose_sequence` are meant to render into lemlist's UI panel. They return successfully from the CLI, but you get a data reference rather than a rendered table.
+
+### Write guards
+
+The MCP is 65 mutating tools deep, and some of them spend money. `lem` grades them:
+
+- **read** — runs as-is.
+- **write** — refuses without `--yes`.
+- **DANGER** — refuses without **both** `--yes` and `--force-danger`. Anything that charges Stripe (`purchase_domain`), rewrites DNS, provisions mailboxes, sends real outbound (`send_message`, `launch_campaign`), or destroys data (every `delete_*`).
+
+```bash
+$ lem mcp call purchase_domain --set domain=acme.com --yes
+purchase_domain is billing-affecting or irreversible.
+  it needs BOTH --yes and --force-danger.
+  inspect it first:  lem mcp help purchase_domain
+```
+
+`--dry-run` prints the exact request and sends nothing.
 
 ---
 
-## Output Conventions
+## `lem dump-all` — read-only tenant snapshot
 
-| Stream | Goes to | Contents                                                              |
-| ------ | ------- | --------------------------------------------------------------------- |
-| stdout | data    | The JSON response from lemlist (or whatever `--out` writes to a file) |
-| stderr | meta    | Progress messages (`dump-all` phases), warnings, error messages       |
-
-This means piping and redirection always work cleanly:
+GET-only, resumable, atomic writes. It cannot mutate your tenant.
 
 ```bash
-./lemlist get-many-campaigns --all | jq '.[] | {id: ._id, name}'
-./lemlist get-team > team.json 2> /dev/null
-./lemlist dump-all dumps/2026-05-04 2> dump.log
+lem dump-all ../lemlist-data                    # Phase 1: every list endpoint
+lem dump-all ../lemlist-data --with-campaigns   # + per-campaign drill
+lem dump-all ../lemlist-data --deep             # every phase
 ```
 
-All responses are pretty-printed JSON. Use `--out PATH` to write to a file instead of stdout (handy for very large payloads).
+| flag | phase |
+|---|---|
+| *(none)* | 1 — list endpoints |
+| `--with-campaigns` | 2 — per-campaign endpoints |
+| `--with-users` | 3 — per-user profile, inbox, per-mailbox lemwarm |
+| `--with-lists` | 4 — contact-list contents |
+| `--with-companies` | 5 — per-company notes |
+| `--with-schedules` | 6 — full schedule details |
+| `--with-search` | 7 — the two read-only POST searches + batch campaign stats |
+| `--deep` | all of the above |
+
+Re-runs skip files that already exist, so an interrupted dump resumes where it stopped. `--force` re-fetches. Writes are staged through a `.tmp` and renamed, so a Ctrl+C leaves either complete JSON or nothing.
+
+Some endpoints are excluded by default (mass collections, async export kickoffs, low-signal config) — the run prints exactly what it skipped and why. Pull one back in with `--include <name>`.
+
+**Exclusions are keyed on `(METHOD, path)`, not on command names.** Names are slugified from the spec's `summary` field, and summaries churn: three of ours were silently renamed between the May 2026 spec and the live one. Paths are stable. This is why the snapshot survives spec revisions.
 
 ---
 
-## Commands by Domain
+## Conventions
 
-`./lemlist commands` prints the full alphabetised list (120 entries). Grouped below by what each endpoint touches:
-
-<details>
-<summary><b>Campaigns</b> — create, update, pause, start, duplicate, stats, exports</summary>
-
-```
-get-many-campaigns                          GET    /campaigns
-get-campaign                                GET    /campaigns/{campaignId}
-get-campaign-reports                        GET    /campaigns/reports
-get-campaign-sequences                      GET    /campaigns/{campaignId}/sequences
-get-campaign-schedules                      GET    /campaigns/{campaignId}/schedules
-get-campaign-statutes                       GET    /campaigns/{campaignId}/statutes
-get-campaign-stats                          GET    /v2/campaigns/{campaignId}/stats
-get-batch-campaign-stats                    POST   /v2/campaigns/stats/batch
-create-campaign                             POST   /campaigns
-update-campaign                             PATCH  /campaigns/{campaignId}
-duplicate-campaign                          POST   /campaigns/{campaignId}/duplicate
-start-campaign                              POST   /campaigns/{campaignId}/start
-pause-campaign                              POST   /campaigns/{campaignId}/pause
-associate-schedule-with-campaign            POST   /campaigns/{campaignId}/schedules/{scheduleId}
-export-campaign-leads                       GET    /campaigns/{campaignId}/export/leads
-start-campaign-stats-export                 GET    /campaigns/{campaignId}/export/start
-get-campaign-export-status                  GET    /campaigns/{campaignId}/export/{exportId}/status
-set-email-for-campaign-export-notification  PUT    /campaigns/{campaignId}/export/{exportId}/email/{email}
-```
-</details>
-
-<details>
-<summary><b>Leads</b> — add, update, enrich, pause, mark interested, unsubscribe</summary>
-
-```
-get-lead-by-email                            GET    /leads/{email}
-get-lead-by-email-or-id                      GET    /leads
-get-campaign-leads                           GET    /campaigns/{campaignId}/leads
-create-lead-in-campaign                      POST   /campaigns/{campaignId}/leads
-update-lead-in-a-campaign                    PATCH  /campaigns/{campaignId}/leads/{leadId}
-import-leads-from-crm                        POST   /campaigns/{campaignId}/leads/import
-enrich-lead                                  POST   /leads/{leadId}/enrich
-pause-lead                                   POST   /leads/pause/{leadId}
-resume-paused-lead                           POST   /leads/start/{leadId}
-mark-lead-as-interested                      POST   /leads/interested/{leadIdOrEmail}
-mark-lead-as-not-interested                  POST   /leads/notinterested/{leadIdOrEmail}
-mark-lead-as-interested-in-campaign          POST   /campaigns/{campaignId}/leads/{leadIdOrEmail}/interested
-mark-lead-as-not-interested-in-campaign      POST   /campaigns/{campaignId}/leads/{leadIdOrEmail}/notinterested
-delete-or-unsubscribe-lead                   DELETE /campaigns/{campaignId}/leads/{leadId}
-unsubscribe-lead-from-campaign               DELETE /campaigns/{campaignId}/leads
-add-custom-variables-on-leads                POST   /leads/{leadId}/variables
-update-values-of-custom-variables-of-a-lead  PATCH  /leads/{leadId}/variables
-erase-values-of-custom-variables-on-a-lead   DELETE /leads/{leadId}/variables
-upload-audio-for-voice-message-step          POST   /leads/audio
-```
-</details>
-
-<details>
-<summary><b>Sequences</b> — add / update / delete steps</summary>
-
-```
-add-step-to-sequence                        POST   /sequences/{sequenceId}/steps
-update-sequence-step                        PATCH  /sequences/{sequenceId}/steps/{stepId}
-delete-sequence-step                        DELETE /sequences/{sequenceId}/steps/{stepId}
-```
-</details>
-
-<details>
-<summary><b>Schedules</b></summary>
-
-```
-get-many-schedules                          GET    /schedules
-get-schedule                                GET    /schedules/{scheduleId}
-create-schedule                             POST   /schedules
-update-schedule                             PATCH  /schedules/{scheduleId}
-delete-schedule                             DELETE /schedules/{scheduleId}
-```
-</details>
-
-<details>
-<summary><b>Contacts &amp; Contact Lists</b></summary>
-
-```
-get-many-contacts                           GET    /contacts
-get-contact                                 GET    /contacts/{idOrEmail}
-add-and-update-contact                      POST   /contacts
-get-contact-lists                           GET    /contacts/lists
-create-contact-list                         POST   /contacts/lists
-add-contacts-to-list                        POST   /contacts/lists/{listId}/entities
-export-contact-list                         GET    /contacts/export
-```
-</details>
-
-<details>
-<summary><b>Companies</b></summary>
-
-```
-get-many-companies                          GET    /companies
-add-and-update-company                      POST   /companies
-get-company-notes                           GET    /companies/{companyId}/notes
-create-company-note                         POST   /companies/{companyId}/notes
-```
-</details>
-
-<details>
-<summary><b>Inbox</b> — conversations, drafts, labels, send</summary>
-
-```
-get-many-inboxes                            GET    /inbox
-get-contact-messages                        GET    /inbox/{contactId}
-list-drafts                                 GET    /inbox/{contactId}/drafts
-get-draft                                   GET    /inbox/{contactId}/drafts/{draftId}
-create-draft                                POST   /inbox/{contactId}/drafts
-update-draft                                PATCH  /inbox/{contactId}/drafts/{draftId}
-delete-draft                                DELETE /inbox/{contactId}/drafts/{draftId}
-send-email                                  POST   /inbox/email
-send-linkedin-message                       POST   /inbox/linkedin
-send-whatsapp-message                       POST   /inbox/whatsapp
-get-many-labels                             GET    /inbox/labels
-get-label                                   GET    /inbox/labels/{labelId}
-create-label                                POST   /inbox/labels
-attach-labels-to-conversations              POST   /inbox/conversations/labels/{contactId}
-remove-labels-from-conversation             DELETE /inbox/conversations/labels/{contactId}
-```
-</details>
-
-<details>
-<summary><b>Lemwarm</b></summary>
-
-```
-get-lemwarm-settings                        GET    /lemwarm/{userMailboxId}/settings
-update-lemwarm-settings                     PATCH  /lemwarm/{userMailboxId}/settings
-start-lemwarm                               POST   /lemwarm/{userMailboxId}/start
-pause-lemwarm                               POST   /lemwarm/{userMailboxId}/pause
-```
-</details>
-
-<details>
-<summary><b>Unsubscribes</b></summary>
-
-```
-get-many-unsubscribes                       GET    /unsubscribes
-get-unsubscribe-by-email                    GET    /unsubscribes/{email}
-add-unsubscribe-email-or-domain             POST   /unsubscribes/{email}
-delete-unsubscribe-email                    DELETE /unsubscribes/{email}
-export-unsubscribes                         GET    /unsubs/export
-get-contact-subscription-status             GET    /v2/unsubscribes/contacts/{contactId}
-unsubscribe-contact                         POST   /v2/unsubscribes/contacts/{contactId}
-re-subscribe-contact                        DELETE /v2/unsubscribes/contacts/{contactId}
-list-unsubscribed-variables                 GET    /v2/unsubscribes/variables
-get-unsubscribed-variable                   GET    /v2/unsubscribes/variables/{value}
-unsubscribe-variable                        POST   /v2/unsubscribes/variables/{value}
-re-subscribe-variable                       DELETE /v2/unsubscribes/variables/{value}
-bulk-unsubscribe-variables                  POST   /v2/unsubscribes/variables
-export-unsubscribed-contacts                GET    /v2/unsubscribes/exports/contacts
-export-unsubscribed-variables               GET    /v2/unsubscribes/exports/variables
-```
-</details>
-
-<details>
-<summary><b>Webhooks</b></summary>
-
-```
-get-many-webhooks                           GET    /hooks
-add-webhook                                 POST   /hooks
-delete-webhook                              DELETE /hooks/{hookId}
-```
-</details>
-
-<details>
-<summary><b>Team, Users, Email Accounts</b></summary>
-
-```
-get-team                                    GET    /team
-get-team-credits                            GET    /team/credits
-get-team-senders                            GET    /team/senders
-get-team-crm-users                          GET    /team/crmUsers
-get-user                                    GET    /users/{userId}
-get-user-channels                           GET    /user/channels
-connect-email-account                       POST   /user/email-accounts
-disconnect-email-account                    DELETE /user/email-accounts/{emailAccountId}
-test-email-account                          POST   /user/email-accounts/{emailAccountId}/test
-```
-</details>
-
-<details>
-<summary><b>Tasks</b></summary>
-
-```
-get-many-tasks                              GET    /tasks
-create-task                                 POST   /tasks
-update-task                                 PATCH  /tasks
-ignore-tasks                                POST   /tasks/ignore
-```
-</details>
-
-<details>
-<summary><b>Activities</b></summary>
-
-```
-get-many-activities                         GET    /activities
-delete-activity-recording-transcript        DELETE /activities/{activityId}/recording-transcript
-```
-</details>
-
-<details>
-<summary><b>Enrichment</b></summary>
-
-```
-enrich-data                                 POST   /enrich
-get-enrichment-result                       GET    /enrich/{enrichId}
-bulk-enrich-data                            POST   /v2/enrichments/bulk
-```
-</details>
-
-<details>
-<summary><b>lemleads (B2B database)</b></summary>
-
-```
-search-people-database                      POST   /database/people
-search-companies-database                   POST   /database/companies
-get-database-filters                        GET    /database/filters
-get-people-schema                           GET    /schema/people
-get-companies-schema                        GET    /schema/companies
-```
-</details>
-
-<details>
-<summary><b>Misc</b> — fields, CRM filters, watchlist</summary>
-
-```
-list-fields                                 GET    /fields
-get-crm-filters                             GET    /crm/filters
-get-watchlist-signals                       GET    /watchlist/signals
-```
-</details>
+- JSON to stdout, progress and diagnostics to stderr — pipe freely.
+- The `Authorization` / `X-API-Key` header is never logged, never printed in `--dry-run` output.
+- Exit codes: `0` ok, `1` validation or refused guard, `5` not found, `6` MCP error, `127` official CLI missing.
+- Cache lives in `~/.lem/` (override with `LEM_CACHE_DIR`). OpenAPI spec: 1h TTL. MCP tools: 24h.
+- Point at a different official CLI binary with `LEMLIST_BIN`.
 
 ---
 
-## Write Methods
+## Upgrading from v0.2
 
-For POST / PUT / PATCH, the help output extracts the body schema from the spec. Top-level **primitive** fields (string / integer / number / boolean) are exposed as `--<field>` flags. Complex fields (objects, arrays of objects) require `--body`.
+v0.2 was 120 REST commands generated from a **vendored** `openapi.json`. By August 2026 that snapshot was 12 paths and 23 operations behind the live API, and rotting further every week. The official CLI solves that properly, so v0.3 deletes our copy rather than maintaining a worse one.
 
-```bash
-# `help` shows what's available
-$ ./lemlist help create-campaign
-create-campaign
-  POST /campaigns
-  Create Campaign
+| v0.2 | v0.3 |
+|---|---|
+| `lemlist get-many-campaigns` | `lem rest campaigns list` |
+| `lemlist get-campaign cam_123` | `lem rest campaigns get cam_123` |
+| `lemlist <any generated command>` | `lem rest api <METHOD> <path>` |
+| `lemlist dump-all <dir>` | `lem dump-all <dir>` *(unchanged)* |
+| — | `lem mcp ...` *(new)* |
 
-Body flags:
-  --body JSON     JSON string for the request body
-  --body-file F   path to a JSON body file (use - for stdin)
-
-  Top-level fields from the spec:
-    --name (required)  [string] The name of the campaign
-    --timezone         [string] IANA timezone for the campaign schedule
-                                 (defaults to `Europe/Paris` if omitted)
-```
-
-```bash
-# Simple body — use primitive flags
-./lemlist create-campaign --name "Q3 outbound" --timezone Australia/Sydney
-
-# Complex body — pass JSON directly
-./lemlist update-campaign cam_xxx --body '{"sendUserIds":["usr_abc","usr_def"]}'
-
-# Or load body from file (or stdin)
-./lemlist update-campaign cam_xxx --body-file body.json
-./lemlist update-campaign cam_xxx --body-file -    < body.json
-
-# Flags merge into --body, with flags winning on conflict
-./lemlist update-campaign cam_xxx --body '{"name":"foo"}' --name "bar"
-```
-
-DELETE endpoints take only path params:
-
-```bash
-./lemlist delete-schedule sch_xxx
-./lemlist delete-sequence-step seq_xxx stp_xxx
-```
-
-### Preview before writing
-
-POST / PUT / PATCH / DELETE all support `--dry-run`. The CLI prints the exact request it *would* send (method, URL, headers minus auth, JSON body) and exits without touching lemlist. `--dry-run` doesn't require `LEMLIST_API_KEY` to be set.
-
-```bash
-$ ./lemlist delete-schedule sch_xxx --dry-run
-{
-  "_dry_run": true,
-  "method": "DELETE",
-  "url": "https://api.lemlist.com/api/schedules/sch_xxx",
-  "headers": { ... },
-  "body": null
-}
-```
-
-Combine `--dry-run --verbose` to also stream the request line to stderr in a more terminal-friendly format.
-
----
-
-## Bulk Dump (read-only)
-
-```bash
-./lemlist dump-all dumps/2026-05-04
-./lemlist dump-all dumps/2026-05-04 --with-campaigns
-./lemlist dump-all dumps/2026-05-04 --deep   # everything
-```
-
-`dump-all` snapshots your tenant by walking lemlist's list endpoints. It is **strictly read-only** — write methods (POST/PUT/PATCH/DELETE) are never invoked, and the three POSTs it does call (`search-people-database`, `search-companies-database`, `get-batch-campaign-stats`) are read-only search/aggregate endpoints.
-
-| Flag                 | What it adds                                                                                                                                                |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| *(no flag)*          | **Phase 1**: every GET list endpoint with no required path arg → `<dir>/lists/<command>.json`                                                                |
-| `--with-campaigns`   | **Phase 2**: per-campaign endpoints (`get-campaign`, `get-campaign-sequences`, `get-campaign-statutes`, ...) for every campaign returned by `get-many-campaigns` |
-| `--with-users`       | **Phase 3**: per-user profile + inbox + per-mailbox lemwarm settings                                                                                         |
-| `--with-lists`       | **Phase 4**: exports the contents of every contact list                                                                                                      |
-| `--with-companies`   | **Phase 5**: per-company notes                                                                                                                              |
-| `--with-schedules`   | **Phase 6**: full per-schedule details                                                                                                                      |
-| `--with-search`      | **Phase 7**: read-only POSTs — lemleads search + chunked 365-day batch campaign stats                                                                       |
-| `--deep`             | All of the above                                                                                                                                            |
-| `--include name,...` | Force-include endpoints that are excluded by default (e.g. `get-many-activities`)                                                                           |
-| `--force`            | Re-fetch endpoints whose output file already exists                                                                                                         |
-
-Dumps are **resumable** — re-running against the same target directory skips files that already exist. Date-stamp the directory so you can diff snapshots over time.
-
-```bash
-# A monthly snapshot you can diff
-./lemlist dump-all dumps/$(date +%Y-%m-%d) --deep
-
-# A second run picks up where the first left off
-./lemlist dump-all dumps/2026-05-04 --deep    # → "cached" for everything already pulled
-```
-
-Endpoints requiring IDs/emails (`get-contact`, `get-lead-by-email`) and large/low-signal collections (`get-many-activities`, `get-many-contacts`) are skipped by default and listed at the end of the run.
-
----
-
-## Global Options
-
-These flags work on every endpoint command:
-
-| Flag               | Purpose                                                                                       |
-| ------------------ | --------------------------------------------------------------------------------------------- |
-| `--all`            | Auto-paginate (offset/limit or page-based). GET only.                                         |
-| `--out PATH`       | Write JSON to a file instead of stdout. Prints byte count to stderr.                          |
-| `--user NAME`      | Basic-auth username (default: empty — lemlist's standard).                                    |
-| `--body JSON`      | JSON string for POST/PUT/PATCH body.                                                          |
-| `--body-file PATH` | Load body from a file. Use `-` for stdin.                                                     |
-| `--verbose`        | Print the HTTP method, URL, and non-auth headers to stderr before sending.                    |
-| `--dry-run`        | (POST/PUT/PATCH/DELETE only.) Print the request that *would* be sent and exit without sending. Doesn't require an API key. |
-
-Top-level flags (run before any command):
-
-| Flag             | Purpose                       |
-| ---------------- | ----------------------------- |
-| `--help`, `-h`   | Show usage and exit.          |
-| `--version`, `-V` | Show CLI version and exit.    |
-
-For POST/PUT/PATCH, the script also adds `--<field>` flags for every primitive top-level body property in the spec (see `./lemlist help <command>`).
-
----
-
-## Exit Codes
-
-| Code | Meaning                                                                                            |
-| ---- | -------------------------------------------------------------------------------------------------- |
-| `0`  | Success.                                                                                            |
-| `1`  | Any error: missing/wrong API key, missing required flag, network failure, lemlist returned 4xx/5xx, etc. The error message goes to stderr. |
-
-(The CLI doesn't currently distinguish error types via exit codes; if you need to differentiate, check the stderr message or the script's stderr line for `HTTP <code>`.)
-
----
-
-## Updating the Spec
-
-The CLI builds its command table from `openapi.json` at startup. To pick up new lemlist endpoints, refresh that file — **no code changes needed**:
-
-```bash
-curl -fsSL https://developer.lemlist.com/api-reference/openapi/v2.json -o openapi.json
-./lemlist commands    # new endpoints appear immediately
-```
-
-If lemlist removes or renames an endpoint, the corresponding command disappears (or gets a new slug derived from the new `summary`/`operationId`). Run `./lemlist commands` after a refresh to see the diff.
+The `lemlist` entry point still exists as a shim: it forwards `dump-all`, `doctor`, `rest` and `mcp`, and points anything else at its replacement. The vendored `openapi.json` is gone — the spec is fetched live and cached.
 
 ---
 
 ## Troubleshooting
 
-| Symptom                                         | Likely cause / fix                                                                                                                                                                                                                                                                                              |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HTTP 401`                                      | `LEMLIST_API_KEY` isn't set, or the value is wrong. Check `echo $LEMLIST_API_KEY` and re-`source` your env file.                                                                                                                                                                                                |
-| `HTTP 403`                                      | Key valid, but your lemlist plan doesn't include that endpoint (lemleads database search, enrichment, and some v2 endpoints are tier-gated).                                                                                                                                                                    |
-| `Malformed filters` on `get-many-tasks`         | Observed on some tenants — lemlist API quirk, not the CLI. Pass `--status pending` (or another filter) to dodge it, or skip the endpoint.                                                                                                                                                                       |
-| `search-people-database` returns 0 results      | The default body sends `{"filters": [], "page": 1, "size": 100}`. lemlist's people DB needs at least one filter to return data: `./lemlist search-people-database --body '{"filters":[{"filterId":"country","in":["AU"],"out":[]}],"page":1,"size":100}'`. Discover valid filter IDs via `get-database-filters`. |
-| `dump-all` reports `skipped (required-flag)`    | The endpoint needs a flag the dump can't auto-fill. Call it directly with the right `--flag`.                                                                                                                                                                                                                   |
-| Timeouts on `get-many-activities` / `-contacts` | These can hold thousands of records per page and time out on huge tenants. Excluded from `dump-all` by default — include explicitly: `--include get-many-activities`.                                                                                                                                           |
+**`official lemlist CLI not found on PATH`** — `npm install -g @lemlist-official/cli`, or set `LEMLIST_BIN` to its location.
+
+**`set LEMLIST_API_KEY in your environment`** — export it, or run `lem rest auth login` to use an OAuth profile for the REST surface. Note that `lem mcp` and `lem dump-all` need the raw key; they don't read the official CLI's profile store.
+
+**`MCP error -32602: X-API-Key header or Authorization: Bearer token is required`** — the key isn't reaching the MCP endpoint. Check `lem doctor`.
+
+**A `dump-all` endpoint fails with a 400 about a required filter** — it's a lookup endpoint the spec marks as unfiltered. Call it directly through `lem rest` with the filter it wants, and open an issue so it can be added to `LOOKUP_ONLY_PATHS`.
+
+**`lemlist: PATH loop`** — something earlier on `PATH` is also named `lemlist` and execs this repo's shim, so `lem rest` resolved back to itself. `lem` prefers a binary whose realpath sits inside `@lemlist-official` and refuses to call its own shim, but a wrapper that hides the real one still wins. Either point `LEMLIST_BIN` at the official CLI, or rename the wrapper so it stops claiming the name:
+
+```bash
+export LEMLIST_BIN=$(npm root -g)/@lemlist-official/cli/dist/cli.js
+```
+
+**Stale command surface** — `lem mcp tools --refresh` re-reads the tool list; `lem dump-all --refresh-spec` re-reads the OpenAPI spec.
 
 ---
 
-## Development
-
-No build step — `lemlist` is a single executable Python file. To work on it:
-
-```bash
-git clone https://github.com/ben-broadley/lemlist-cli.git
-cd lemlist-cli
-# Edit `lemlist`, run it.
-```
-
-The command table is auto-built from `openapi.json` on every invocation. To pull a fresh spec from lemlist:
-
-```bash
-curl -fsSL https://developer.lemlist.com/api-reference/openapi/v2.json -o openapi.json
-```
-
-There are no unit tests at the moment — the OpenAPI spec is the contract. A quick sanity check:
-
-```bash
-./lemlist commands            # should list 120 commands
-./lemlist help get-team       # should render without error
-python3 -c "import ast; ast.parse(open('lemlist').read()); print('parses OK')"
-```
-
----
-
-## Bug Reports
+## Bug reports
 
 [github.com/ben-broadley/lemlist-cli/issues](https://github.com/ben-broadley/lemlist-cli/issues)
 
----
-
 ## License
 
-[MIT](LICENSE).
+MIT — see [LICENSE](LICENSE).
